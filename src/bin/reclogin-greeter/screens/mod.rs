@@ -8,21 +8,27 @@
 //! field. While PAM asks further questions (an expired password) the
 //! [`conversation`] screen is drawn instead. [`other`] is "Other user…" and
 //! the screen of a system with no listed account; [`prompt`] is the guest and
-//! returning to a running session. Later stages add the rest of the design
-//! canvas (shutting down, the on-screen keyboard, the second monitor, the
-//! text-login fallback) beside them. The open session menu is drawn over
+//! returning to a running session; [`shutdown`] is the question before a
+//! restart or shut down while others are logged in. Later stages add the
+//! rest of the design canvas (the on-screen keyboard, the second monitor,
+//! the text-login fallback) beside them. The open session menu is drawn over
 //! whichever screen it belongs to.
 
 pub mod conversation;
 pub mod login;
 pub mod other;
 pub mod prompt;
+pub mod shutdown;
 
 use crate::form::Screen;
 use crate::paint::Painter;
 
 /// Draw the screen the form is on.
 pub fn draw(p: &mut Painter, v: &login::View) {
+    if let Some(action) = v.form.question {
+        shutdown::draw(p, v, action);
+        return;
+    }
     if v.form.talking() {
         conversation::draw(p, v);
         return;
@@ -49,6 +55,8 @@ pub enum Target {
     LogIn,
     /// "Cancel" and "Someone else" while PAM asks further questions.
     Cancel,
+    /// "… anyway" on the power question.
+    Confirm,
     Session,
     /// One entry of the open session menu (index into `State::sessions`).
     SessionOption(usize),
@@ -64,6 +72,8 @@ pub struct Clock {
     pub time: String,
     pub date: String,
     pub greeting: &'static str,
+    /// The instant these were made from, for "since 19:10" on a screen.
+    pub now: DateTime<Local>,
 }
 
 impl Clock {
@@ -83,6 +93,7 @@ impl Clock {
             time,
             date,
             greeting,
+            now,
         }
     }
 }

@@ -1,0 +1,22 @@
+#%PAM-1.0
+# reclogin's guest session. No password. Only the guest account. Only reclogin
+# starts this service, and only when the Guest entry was chosen.
+#
+# Installed as /etc/pam.d/reclogin-guest on AcornOS. The same lines as
+# dist/pam/reclogin-guest.levitateos (docs/reclogin-guest.md, point 4): the
+# leading `-` skips a module that is not installed, so pam_elogind registers
+# the session here and pam_systemd is skipped. reclogind checks after
+# pam_open_session that the login service registered it (XDG_SESSION_ID)
+# and refuses the guest otherwise. pam_limits reads
+# /etc/security/limits.d/50-reclogin-guest.conf (nproc for the uid sweep).
+# Expected in Alpine's linux-pam package: pam_succeed_if, pam_permit,
+# pam_deny, pam_limits, pam_unix (not checked against its file list).
+auth      requisite  pam_succeed_if.so quiet user = guest
+auth      required   pam_permit.so
+account   requisite  pam_succeed_if.so quiet user = guest
+account   required   pam_permit.so
+password  required   pam_deny.so
+session   required   pam_limits.so
+session   required   pam_unix.so
+-session  optional   pam_systemd.so
+-session  optional   pam_elogind.so

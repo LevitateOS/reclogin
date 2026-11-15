@@ -1,7 +1,7 @@
 //! What the person has chosen, typed and focused on the login screen, and
 //! how keys and clicks change it. No drawing and no devices here.
 
-use reclogin::protocol::{MessageKind, PromptKind, State, User, Who};
+use reclogin::protocol::{MessageKind, PowerAction, PromptKind, State, User, Who};
 use zeroize::{Zeroize, Zeroizing};
 
 /// The longest password accepted, in characters. With at most four bytes a
@@ -40,8 +40,12 @@ pub enum Focus {
     Session,
     Layout,
     LogIn,
-    /// "Cancel" while PAM asks further questions.
+    /// "Cancel" while PAM asks further questions, and on the power question.
     Cancel,
+    /// A power action of the footer (Tab reaches them after "Log in").
+    Power(PowerAction),
+    /// "… anyway" on the power question.
+    Confirm,
 }
 
 /// A key, as the keyboard layout produced it.
@@ -73,6 +77,12 @@ pub enum Action {
     ChooseSession(String),
     /// Switch to the next keyboard layout.
     NextLayout,
+    /// Ask for a power action; `confirmed` once the person has been told
+    /// who else is logged in and agreed.
+    Power {
+        action: PowerAction,
+        confirmed: bool,
+    },
 }
 
 /// The row of the list that is chosen.
@@ -167,6 +177,13 @@ pub struct Form {
     /// `State::sessions`) highlighted.
     pub menu: Option<usize>,
     pub talk: Talk,
+    /// The power question ("Shut down for everyone?") is shown for this
+    /// action; only Restart and Shut down ask, and only when others are
+    /// logged in.
+    pub question: Option<PowerAction>,
+    /// `return_to` was sent: the answer clears `busy` again (success too,
+    /// since the screen is not shown any more).
+    pub returning: bool,
 }
 
 impl Form {
@@ -184,6 +201,8 @@ impl Form {
             session: None,
             menu: None,
             talk: Talk::default(),
+            question: None,
+            returning: false,
         };
         form.row = form.first_row(state);
         form.session = form.default_session(state);
@@ -223,6 +242,27 @@ impl Form {
             self.session = self.default_session(state);
         }
         if self.row != before {
+            self.focus = self.entry_focus(state);
+        }
+        // A power action that is gone, or a question nobody needs any more
+        // (the others logged out): the question closes.
+        if self.question.is_some_and(|a| !power_asks(state, a)) {
+            self.question = None;
+            self.focus = self.entry_focus(state);
+        }
+        if let Focus::Power(action) = self.focus {
+            if !power_allowed(state, action) {
+                self.focus = self.entry_focus(state);
+            }
+        }
+        // The chosen person got a session (or lost it) while the screen was
+        // shown: the screen changes (password field, or the return button),
+        // and focus must not stay on a field that is gone.
+        let screen = self.screen(state);
+        if !self.talking()
+            && ((self.focus == Focus::Password && !screen.has_password())
+                || (self.focus == Focus::UserName && !screen.has_user_name()))
+        {
             self.focus = self.entry_focus(state);
         }
         self.menu = None;
@@ -397,11 +437,20 @@ impl Form {
 
     fn focus_order(&self, state: &State) -> Vec<Focus> {
         let multiple_layouts = state.layouts.len() > 1;
+        if self.question.is_some() {
+            let mut order = vec![Focus::Confirm, Focus::Cancel];
+            if multiple_layouts {
+                order.push(Focus::Layout);
+            }
+            order.extend(power_focuses(state));
+            return order;
+        }
         if self.talking() {
             let mut order = vec![Focus::Password, Focus::LogIn, Focus::Cancel];
             if multiple_layouts {
                 order.push(Focus::Layout);
             }
+            order.extend(power_focuses(state));
             return order;
         }
         let screen = self.screen(state);
@@ -422,6 +471,7 @@ impl Form {
             order.push(Focus::Layout);
         }
         order.push(Focus::LogIn);
+        order.extend(power_focuses(state));
         order
     }
 
@@ -494,8 +544,71 @@ impl Form {
         None
     }
 
+    /// A footer power action was chosen (pointer, or Enter or Space on it).
+    /// Restart and Shut down while others are logged in open the question;
+    /// anything else is asked for at once. Not while a login is under way.
+    pub fn press_power(&mut self, action: PowerAction, state: &State) -> Option<Action> {
+        if self.busy || !power_allowed(state, action) {
+            return None;
+        }
+        self.notice = None;
+        self.menu = None;
+        if power_asks(state, action) {
+            self.question = Some(action);
+            // Not on "… anyway": Enter must not shut everyone's work down.
+            self.focus = Focus::Cancel;
+            return None;
+        }
+        self.question = None;
+        self.focus = Focus::Power(action);
+        Some(Action::Power {
+            action,
+            confirmed: false,
+        })
+    }
+
+    /// Leave the power question: focus goes back to the footer action it
+    /// was opened from.
+    pub fn close_question(&mut self, state: &State) {
+        let Some(action) = self.question.take() else {
+            return;
+        };
+        self.focus = if power_allowed(state, action) {
+            Focus::Power(action)
+        } else {
+            self.entry_focus(state)
+        };
+    }
+
+    fn question_key(&mut self, key: Key, state: &State) -> Option<Action> {
+        let action = self.question?;
+        match key {
+            Key::Console(n) => return Some(Action::SwitchConsole(n)),
+            Key::Tab => self.move_focus(state, true),
+            Key::BackTab => self.move_focus(state, false),
+            Key::Escape => self.close_question(state),
+            Key::Enter | Key::Char(' ') => match self.focus {
+                Focus::Confirm => {
+                    return Some(Action::Power {
+                        action,
+                        confirmed: true,
+                    })
+                }
+                Focus::Cancel => self.close_question(state),
+                Focus::Power(other) => return self.press_power(other, state),
+                Focus::Layout => return (state.layouts.len() > 1).then_some(Action::NextLayout),
+                _ => {}
+            },
+            _ => {}
+        }
+        None
+    }
+
     /// Apply a key. Returns what the program must do beyond redrawing.
     pub fn key(&mut self, key: Key, state: &State) -> Option<Action> {
+        if self.question.is_some() {
+            return self.question_key(key, state);
+        }
         if self.menu.is_some() {
             return self.menu_key(key, state);
         }
@@ -524,14 +637,17 @@ impl Form {
                 Focus::Cancel => return Some(Action::Cancel),
                 Focus::Session => self.open_menu(state),
                 Focus::Layout => return (state.layouts.len() > 1).then_some(Action::NextLayout),
+                Focus::Power(action) => return self.press_power(action, state),
+                Focus::Confirm => {}
             },
             Key::Char(' ')
                 if matches!(
                     self.focus,
-                    Focus::Session | Focus::LogIn | Focus::Cancel | Focus::Layout
+                    Focus::Session | Focus::LogIn | Focus::Cancel | Focus::Layout | Focus::Power(_)
                 ) =>
             {
                 match self.focus {
+                    Focus::Power(action) => return self.press_power(action, state),
                     Focus::Session => self.open_menu(state),
                     Focus::Layout => {
                         return (state.layouts.len() > 1).then_some(Action::NextLayout)
@@ -624,4 +740,34 @@ impl Form {
         }
         Some(Action::Submit)
     }
+}
+
+/// Whether the footer offers `action` (the login service allows it).
+pub fn power_allowed(state: &State, action: PowerAction) -> bool {
+    match action {
+        PowerAction::Sleep => state.power.sleep,
+        PowerAction::Restart => state.power.restart,
+        PowerAction::ShutDown => state.power.shut_down,
+    }
+}
+
+/// Whether `action` asks first: Restart and Shut down end other people's
+/// sessions. Sleep keeps them.
+pub fn power_asks(state: &State, action: PowerAction) -> bool {
+    power_allowed(state, action)
+        && action != PowerAction::Sleep
+        && !state.others_logged_in.is_empty()
+}
+
+/// The footer's power actions in the order drawn and tabbed.
+fn power_focuses(state: &State) -> Vec<Focus> {
+    [
+        PowerAction::Sleep,
+        PowerAction::Restart,
+        PowerAction::ShutDown,
+    ]
+    .into_iter()
+    .filter(|a| power_allowed(state, *a))
+    .map(Focus::Power)
+    .collect()
 }

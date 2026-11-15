@@ -1,0 +1,28 @@
+#!/bin/sh
+# Installed as /usr/libexec/reclogin/reclogin-guest-notice (mode 0755, both
+# OSes). docs/reclogin-guest.md, point 5, "What the guest is told": one
+# desktop notification when the guest session starts, over the session bus's
+# standard org.freedesktop.Notifications interface, which Plasma and LXQt
+# both serve. Started by the autostart entry in the guest defaults tree
+# (guest-home/.config/autostart/reclogin-guest-notice.desktop). reclogin
+# draws nothing inside the session.
+#
+# notify-send (libnotify) when present, else gdbus (GLib); neither is
+# required: without them nothing is shown.
+
+[ "$(id -u)" = 60600 ] || exit 0
+
+summary="Guest session"
+body="You are using a guest session. Everything here is deleted when you log out. Save what you want to keep on a USB drive."
+
+if command -v notify-send >/dev/null 2>&1; then
+    exec notify-send --app-name=reclogin --icon=dialog-information --expire-time=0 "$summary" "$body"
+fi
+if command -v gdbus >/dev/null 2>&1; then
+    exec gdbus call --session \
+        --dest org.freedesktop.Notifications \
+        --object-path /org/freedesktop/Notifications \
+        --method org.freedesktop.Notifications.Notify \
+        reclogin 0 dialog-information "$summary" "$body" '[]' '{}' 0 >/dev/null
+fi
+exit 0

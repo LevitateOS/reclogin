@@ -1,0 +1,10 @@
+# Installed as /usr/share/reclogin/guest-home/.config/autostart/reclogin-guest-notice.desktop
+# (both OSes). docs/reclogin-guest.md, point 5: reclogind copies the guest
+# defaults tree over each fresh guest home, so this lands in the guest's
+# ~/.config/autostart and the desktop shows the notice once at start.
+[Desktop Entry]
+Type=Application
+Name=Guest session notice
+Exec=/usr/libexec/reclogin/reclogin-guest-notice
+NoDisplay=true
+X-KDE-autostart-phase=2

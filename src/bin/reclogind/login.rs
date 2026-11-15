@@ -37,9 +37,8 @@ use reclogin::protocol::{Framed, MessageKind, Secret, ToDaemon, ToGreeter, Who};
 use reclogin::wire::Channel;
 
 use crate::worker::{self, FromWorker, SessionRef, ToWorker};
-use crate::{last, session, sessions, users, Daemon, Next, WHO};
+use crate::{guest, last, session, sessions, users, Daemon, Next, WHO};
 
-const GUEST_NOT_BUILT: &str = "The guest session is not built yet.";
 const NO_SESSION: &str = "No desktop session is installed.";
 const SESSION_GONE: &str = "The chosen session is no longer installed.";
 const NO_CONSOLE: &str = "There is no free console for the session.";
@@ -85,6 +84,9 @@ pub struct Login {
     orphans: Vec<Orphan>,
     /// A line for the next greeter's screen, sent once it has its state.
     notice: Option<String>,
+    /// Whether `begin {who: guest}` may start a guest, set at start
+    /// (`guest::at_start`); refused until then.
+    pub(crate) guest: guest::Setting,
 }
 
 struct Worker {
@@ -97,6 +99,9 @@ struct Worker {
     /// Who and what, for `last.rs` once the session has started.
     user: String,
     session: String,
+    /// A guest login (`guest.rs`): never remembered in `last.rs`; its
+    /// cleanup is run again here when the worker did not finish it.
+    guest: bool,
     /// The id of the question the greeter may answer now.
     prompt: Option<u64>,
     /// Asked to end (by the greeter, or by reclogind): what it still says
@@ -154,6 +159,12 @@ impl Login {
     /// read and its exit is expected.
     pub fn greeter_away(&self) -> bool {
         self.greeter_away
+    }
+
+    /// Whether a login (or the end of one, or a desktop left behind) is
+    /// still going on: returning to another session waits for it.
+    pub fn worker_busy(&self) -> bool {
+        self.worker.is_some() || !self.orphans.is_empty()
     }
 
     /// Whether the greeter's next packet is a raw secret (`answer` came).
@@ -487,7 +498,7 @@ impl Daemon {
             log(WHO, "begin while the last login is still ending; try again");
             return self.try_again();
         }
-        let user = match who {
+        let (user, guest) = match who {
             Who::User { name } => {
                 let listed = users::listable(Path::new("/etc/passwd"), Path::new("/etc/shells"))
                     .iter()
@@ -496,15 +507,23 @@ impl Daemon {
                     log(WHO, "begin for a user not in the list refused");
                     return self.refuse(worker::AUTH_FAILED);
                 }
-                name
+                (name, false)
             }
             Who::TypedUser { name } => {
-                if !valid_name(&name) {
+                // Typing `guest` never starts a guest session, and fails
+                // like a wrong password (docs/reclogin-guest.md, point 4).
+                if !valid_name(&name) || name == guest::NAME {
                     return self.refuse(worker::AUTH_FAILED);
                 }
-                name
+                (name, false)
             }
-            Who::Guest => return self.refuse(GUEST_NOT_BUILT),
+            Who::Guest => {
+                if let Some(text) = self.login.guest.refusal() {
+                    log(WHO, format_args!("guest refused ({:?})", self.login.guest));
+                    return self.refuse(text);
+                }
+                (guest::NAME.to_string(), true)
+            }
         };
         let installed = sessions::installed(
             Path::new(sessions::WAYLAND_DIR),
@@ -546,6 +565,7 @@ impl Daemon {
             console,
             user: user.clone(),
             session: session.id.clone(),
+            guest,
             prompt: None,
             cancelled: false,
             owe_answer: false,
@@ -557,11 +577,15 @@ impl Daemon {
             desktop: None,
             show_by: None,
         };
-        w.send(&ToWorker::Start {
-            user,
-            session,
-            console,
-        });
+        if guest {
+            w.send(&ToWorker::StartGuest { session, console });
+        } else {
+            w.send(&ToWorker::Start {
+                user,
+                session,
+                console,
+            });
+        }
         self.login.worker = Some(w);
         Next::Continue
     }
@@ -656,9 +680,12 @@ impl Daemon {
                 if w.phase == Phase::Starting && console == w.console {
                     w.phase = Phase::Running;
                     w.show_by = None;
-                    // Remembered only now that a session really started.
-                    let (user, session) = (w.user.clone(), w.session.clone());
-                    last::session_started(&user, &session);
+                    // Remembered only now that a session really started;
+                    // never the guest, who is not in the list.
+                    if !w.guest {
+                        let (user, session) = (w.user.clone(), w.session.clone());
+                        last::session_started(&user, &session);
+                    }
                 }
                 Next::Continue
             }
@@ -703,6 +730,12 @@ impl Daemon {
 
     fn worker_exited(&mut self, w: Worker) -> Next {
         let clean = w.phase == Phase::Done && !w.killed;
+        // A guest worker cleans up after its session itself; one that went
+        // away first, or whose cleanup did not finish, leaves it to a thread
+        // here (`guest.rs`), which waits for nothing of the screen.
+        if w.guest && (!clean || guest::cleanup_failed()) {
+            guest::cleanup_in_background();
+        }
         if !clean {
             let left = w.groups_left();
             if !left.is_empty() {
@@ -765,6 +798,10 @@ impl Daemon {
         }
         self.login.greeter_away = false;
         self.login.chosen = None;
+        // The session that just ended must not be marked on the new screen:
+        // the login service is asked again (the answer reaches the greeter
+        // as a new state).
+        self.logind.refresh();
         let shown_now = matches!(vt_state(), Ok(s) if u32::from(s.v_active) == self.console.number);
         if shown_now {
             self.shown = true;

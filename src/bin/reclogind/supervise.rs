@@ -78,6 +78,9 @@ pub struct Supervisor {
     /// Counts greeters started, so that a loop can tell that the greeter
     /// (and its socket) was replaced under it.
     pub generation: u64,
+    /// What the login service last reported (`logind.rs`): who is logged
+    /// in and which power actions are allowed, for every state sent.
+    pub view: crate::logind::View,
 }
 
 impl Supervisor {
@@ -92,7 +95,13 @@ impl Supervisor {
             stopped: None,
             handshake_pending: false,
             generation: 0,
+            view: Default::default(),
         }
+    }
+
+    /// The state a greeter shows now.
+    pub fn state(&self) -> reclogin::protocol::State {
+        crate::state::read(&self.config, &self.view)
     }
 
     /// reclogind is about to make the greeter with process id `pid` go
@@ -168,7 +177,7 @@ impl Supervisor {
         greeter: &mut Greeter,
         display: &Display,
     ) -> std::io::Result<()> {
-        let state = crate::state::read(&self.config);
+        let state = self.state();
         log(
             WHO,
             format_args!(
@@ -184,7 +193,7 @@ impl Supervisor {
             },
             &[display.as_fd()],
         )?;
-        greeter.send(&ToGreeter::State(state), &[])
+        greeter.send(&ToGreeter::State(Box::new(state)), &[])
     }
 
     /// Start greeters until one is up, counting each one that is not.
@@ -330,11 +339,14 @@ static TTY: AtomicI32 = AtomicI32::new(-1);
 static TTY0: AtomicI32 = AtomicI32::new(-1);
 static KEYBOARD_MODE: AtomicI32 = AtomicI32::new(0);
 static SHOW: AtomicU32 = AtomicU32::new(0);
+static OWN: AtomicU32 = AtomicU32::new(0);
 
 /// Record how to give the console back: its descriptor, `/dev/tty0`'s, the
-/// keyboard mode to restore and the console to show. Called by
+/// keyboard mode to restore, the console to show and our own console (the
+/// console to show is only switched to while ours is the one shown). Called by
 /// `Console::take` before it changes anything.
-pub fn arm_last_resort(tty: RawFd, tty0: RawFd, keyboard_mode: libc::c_int, show: u32) {
+pub fn arm_last_resort(tty: RawFd, tty0: RawFd, keyboard_mode: libc::c_int, show: u32, own: u32) {
+    OWN.store(own, Ordering::SeqCst);
     TTY.store(tty, Ordering::SeqCst);
     TTY0.store(tty0, Ordering::SeqCst);
     KEYBOARD_MODE.store(keyboard_mode, Ordering::SeqCst);
@@ -360,6 +372,7 @@ fn last_resort() {
             TTY0.load(Ordering::SeqCst),
             KEYBOARD_MODE.load(Ordering::SeqCst),
             SHOW.load(Ordering::SeqCst),
+            OWN.load(Ordering::SeqCst),
         );
     }
 }
@@ -495,6 +508,7 @@ pub fn reset_console_mode() -> Option<ExitCode> {
         tty0.as_raw_fd(),
         keyboard_mode,
         FALLBACK_CONSOLE,
+        number,
     );
     log(
         WHO,

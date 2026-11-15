@@ -7,7 +7,7 @@ display, with no X server, compositor or toolkit under it. The design is in
 the LevitateOS repository: `docs/reclogin.md`, `docs/reclogin-technical.md`,
 `docs/reclogin-plan.md` and the screens in `docs/reclogin-design/`.
 
-Status: **stages 1, 2, 3, 4 and 9 of the plan, written and compile-checked,
+Status: **stages 1, 2, 3, 4, 5, 7 and 9 of the plan, written and compile-checked,
 never run** (see "Not done").
 
 ## The two programs
@@ -15,6 +15,7 @@ never run** (see "Not done").
 | Program | Runs as | Does |
 |---|---|---|
 | `reclogind` | root | Takes console 7 and puts it in graphics mode, with console switching by signal. Opens the display device and is its master while console 7 is shown. Starts the greeter. Opens input devices when the greeter asks (only `/dev/input/event*` character devices, read-only, non-blocking) and revokes them when the console is left. Reads the users, sessions and keyboard layout. Gives everything back at exit (text mode, keyboard mode, the console it started from). |
+| `reclogind --login-service` | root, started by `reclogind` | The login-service helper (stage 5, below): the only code that talks to logind or elogind over the system bus. Hidden mode, like `--session-worker`. |
 | `reclogin-greeter` | the account `reclogin`, no rights | Receives the display and the input devices as open handles, sets the mode, draws the login screen on the processor (tiny-skia, cosmic-text with only the brand's fonts), reads input through libinput and libxkbcommon, and tells reclogind what the person chose and typed. |
 
 They talk over a Unix `SOCK_SEQPACKET` socket pair, one JSON message per
@@ -125,7 +126,7 @@ development files.
 1. The greeter sends `choose_session` (if a session is chosen) and
    `begin {who}`, and keeps the typed password. reclogind checks the person
    (a listed user must be in the list; a typed name may be any account,
-   root included; the guest is stage 7) and the session (installed; else
+   root included, except `guest`; the guest is stage 7) and the session (installed; else
    the first one), chooses the session's console (the first one after the
    login console that nobody has open; consoles 1 to 6 keep their text
    logins), starts a worker and sends it `start`. While the last login's
@@ -219,9 +220,9 @@ stops asking for a signal when reclogind dies and ignores the loss of its
 socket, keeps waiting for the desktop and closes the session by itself when
 the desktop ends. So stopping, restarting or losing reclogind leaves running
 desktops alone; before the desktop runs, losing reclogind ends the login.
-A restarted reclogind knows nothing of such a session: listing those
-sessions (and returning to them) is stage 5's job, through the login
-service. When reclogind is stopped it ends a login that is not yet running
+A restarted reclogind does not own such a session, but it sees it: stage 5
+lists the sessions through the login service, marks the user as logged in,
+returns to it, and does not take its console from it. When reclogind is stopped it ends a login that is not yet running
 the same way as a `cancel` and waits for the worker (at most fifteen
 seconds).
 
@@ -336,9 +337,10 @@ is chosen, typed and focused, the screens (`screens/`) only draw it.
 | Guest (`prompt.rs`) | the Guest row is chosen: the text and "Start guest session"; the button sends `begin {guest}` | `state-acornos-guest.json` |
 | Return (`prompt.rs`) | a logged-in user is chosen: the text and "Return to ...'s desktop"; the button sends `return_to {user}` | `state-levitateos-return.json`, `state-levitateos-return-refused.json` |
 
-The guest (stage 7) and returning (stage 5) are not built in `reclogind`: the
-guest is refused by `login.rs` and `return_to` is answered in `main.rs`, both
-with an `auth_result` the screen shows as its error line.
+Returning and the power question are stage 5 (below). The return screen
+adds "Session Plasma (Wayland), running since 19:10" from
+`State::running`; a failed return shows under the button as an error line.
+The guest's `begin` is stage 7 (below).
 
 - **Session picker.** Only when two or more valid sessions exist. The label
   opens the menu "Installed desktops" with the session in use ticked: click,
@@ -362,6 +364,211 @@ with an `auth_result` the screen shows as its error line.
   to the button, "Other user…" to the user name; Enter in the user name moves
   to the password. A wrong password keeps the user (or typed name) and the
   session.
+
+## Other people and power (stage 5)
+
+Written and compile-checked, never run: no login service was called.
+
+**The helper.** `reclogind` is single-threaded on purpose (it forks the
+greeter and applies a lock-down between fork and exec), and the D-Bus library
+(`zbus`, pure Rust, blocking API) starts threads. So everything that talks to
+the login service is a separate process, `reclogind --login-service`
+(`src/bin/reclogind/loginhelper.rs`), started by `reclogind` with its end of
+a socket pair as descriptor 3, the crate's own framing, `PR_SET_PDEATHSIG`
+`SIGTERM`, an empty environment. It runs as root, connects to
+`unix:path=/run/dbus/system_bus_socket` and talks only to
+`org.freedesktop.login1`. The messages (`src/bin/reclogind/logind.rs`):
+to the helper `refresh`, `activate {request, id}`, `power {request, action}`;
+from it `report {available, sessions, power}` and `done {request, ok, text}`.
+
+D-Bus calls, all on `/org/freedesktop/login1`, interface
+`org.freedesktop.login1.Manager` unless said: `ListSessions`;
+`org.freedesktop.DBus.Properties.GetAll("org.freedesktop.login1.Session")`
+on each session's path (`Class`, `State`, `VTNr`, `Type`, `Desktop`,
+`Timestamp`); `CanSuspend`, `CanReboot`, `CanPowerOff` (only `yes` shows the
+action); `ActivateSession(s)`; `Suspend(false)`, `Reboot(false)`,
+`PowerOff(false)`. Hibernate is never asked or offered. Signals: one match
+rule, type signal and path namespace `/org/freedesktop/login1`, so every
+signal of the manager, the sessions and the seat (`SessionNew`,
+`SessionRemoved`, `PropertiesChanged`, `PrepareForSleep`, ...) wakes the
+helper; it reads again 150 ms after the last one, on `refresh`, and every
+five seconds whatever happens. A report is sent only when it changed. The
+sessions reported are those on `seat0`, class `user`, state not `closing`.
+With no bus (not up yet, or gone) it reports `available: false` and tries
+again every two seconds. A method call that gets no answer in 25 seconds is
+an error.
+
+**If the helper dies** (or cannot be started) `reclogind` empties its view:
+the screen shows no logged-in marks and no power actions, and logging in
+still works. It is started again after 1 s, then 2, 4, ... at most 30 s; a
+helper that lived a minute starts the next wait from 1 s again. A request
+waiting for it fails with "The login service is not available."
+
+**What the screen shows from it.** `State::users[].logged_in` for users with
+a session, `others_logged_in` (everyone with a session, listed or not),
+`power`, and the new `State::running` (user, the desktop's name, console,
+start time) for the return screen. The desktop's name is the installed
+session whose first `DesktopNames=` entry (else its id) equals the session's
+`Desktop` property and whose kind equals its `Type`; else "Desktop
+(Wayland)" and the like; `tty` is "Text console". A fresh `state` goes to
+the greeter, a paused one included, whenever the view changes. After a
+session reclogind started ended, the login service is asked again before the
+list is trusted (`return_to_login`).
+
+**Returning.** `return_to {user}`: `reclogind` picks the user's newest
+session on `seat0` and asks the helper for `ActivateSession`. When that
+succeeds the greeter gets `auth_result {ok: true}` and `pause`, the inputs
+are revoked and the display is given up (`Daemon::release_display`, the same
+steps as when the kernel asks for the console, which may have come first;
+doing it twice is harmless). The console comes back the usual way
+(`SIGUSR2`): the paused greeter gets `resume` and a fresh read. If the
+service refuses, the greeter gets `auth_result {ok: false}` with "The
+session could not be brought to the front." and the service's reason. If the
+login console is still the one shown five seconds after a success, the
+display is taken back with "The session did not come to the front."
+
+**Power.** The footer's Sleep, Restart and Shut down send
+`power {action, confirmed: false}`. With nobody logged in `reclogind` asks
+the helper. With others logged in, Restart and Shut down open the question
+screen (`screens/shutdown.rs`, `AcornShutDown.dc.html`): "Shut down for
+everyone?" or "Restart for everyone?", who is logged in, "... anyway"
+(sends `confirmed: true`) and "Cancel", the footer action marked. Sleep asks
+nothing. `reclogind` refuses an unconfirmed Restart or Shut down while
+anyone has a session, whatever the greeter sent, and refuses any action the
+service does not allow now. A refusal or failure comes back as the new
+message `power_refused {text}` (the service's reason) and shows as an error
+line under the buttons. After a Restart or Shut down went through nothing
+more is asked. Keyboard: Tab reaches the footer actions after "Log in"
+(Enter or Space presses one); on the question the focus starts on "Cancel"
+(Enter must not shut everyone's work down), Tab goes "... anyway", "Cancel",
+the layout, the actions; Escape or "Cancel" leaves the question and puts
+focus back on the action. The question also closes when the greeter is
+paused or the others log out.
+
+**The display at start and stop.** At start `reclogind` waits up to two
+seconds for the helper's first report. If the console shown then belongs to
+a running user session (a session whose `VTNr` it is, a text login on
+console 1 included), it takes console 7 (graphics mode, switching by
+signal) *without* showing it and without becoming the display's master, and
+starts the greeter paused, as after a session start: the display and state
+go to it when console 7 is shown (someone switches to it), and when that
+session ends while its console is still the one shown and nothing else is,
+`reclogind` shows console 7 (`Service::foreground`). The same rule serves a
+session returned to. A person on another console is left there. When
+`reclogind` stops, its restore (and the last-resort restore) shows the
+console it started from only if console 7 is the one shown; otherwise the
+display is not switched away from whatever is shown.
+
+Protocol additions (version unchanged; every one has a default or is new):
+`State::running` (`#[serde(default)]`), the type `RunningSession`, the
+message `ToGreeter::PowerRefused {text}`. No message shape changed.
+
+## The guest (stage 7)
+
+As `docs/reclogin-guest.md` says, with the owner's decisions of 2026-11-15
+(`src/bin/reclogind/guest.rs`). One fixed account, `guest`, uid and gid
+60600, home `/run/reclogin/guest`, locked (`!*`), made by the sysusers line
+in `dist/sysusers/reclogin.conf`, never at login. `guest = on|off` in
+`/etc/reclogin.conf` (default `on`, `config.rs`).
+
+The account is used only when it is exactly that: uid and gid 60600, that
+home, no other account with uid 60600, and a shadow password starting with
+`!` or `*`. Anything else (an old account called `guest`) means no Guest
+entry, logged with the reason; no tmpfs is mounted over it and no process
+of it is swept.
+
+### Step by step
+
+1. **reclogind starts.** It checks the account and, when it is the guest,
+   runs the cleanup (below) before it takes the console, also with
+   `guest = off`. The screen gets the Guest entry when the setting is on and
+   the account is the guest.
+2. **`begin {who: guest}`.** Refused with "The guest session is switched
+   off." (`guest = off`) or "The guest session is not available." (no valid
+   account). A typed `guest` under "Other user…" fails like a wrong
+   password, before PAM, and the worker refuses the name `guest` and uid
+   60600 in the normal `reclogin` service as well. Otherwise the session is
+   chosen as for a person and a worker is started with `start_guest
+   {session, console}` (a message of its own; `start` is unchanged).
+3. **The worker takes the guest lock** (`/run/reclogin/guest.lock`, `flock`,
+   held to the end of its logout cleanup). Held by a guest session: "A guest
+   session is already running." Held by a cleanup: "The guest session is
+   still being cleared. Try again in a moment."
+4. **The cleanup.** A guest login only starts when it finished completely;
+   otherwise the screen gets "The guest session is still being cleared. Try
+   again in a moment."
+5. **The home.** `/run/reclogin` (root, 0755) and `/run/reclogin/guest`
+   (root, 0000); a tmpfs mounted there with
+   `size=<a quarter of memory, at most 4 GiB>,mode=0700,uid=60600,gid=60600`
+   and `nosuid,nodev`; checked to be a tmpfs (statfs), a mount (its device
+   differs from `/run/reclogin`'s), the guest's, mode 0700 and empty;
+   `/etc/skel` and then `/usr/share/reclogin/guest-home/` copied in, owned by
+   the guest (folders, files, links; set-id bits dropped).
+6. **PAM** `reclogin-guest` for the user `guest`, `PAM_TTY` set, then
+   authenticate and account. No conversation: a question from any module is
+   refused (`Talk::silent`), which fails the login. A module that changes
+   the user away from `guest` fails it too. Then `accepted`.
+7. **The usual path** (`session::run`): console, PAM session, X or Wayland,
+   the desktop, its end. One difference: after `pam_open_session` the PAM
+   environment must hold `XDG_SESSION_ID` (the login service registered the
+   session); without it the session is closed and the screen gets "The
+   session could not be started." The guest is never written to `last.json`.
+8. **Logout.** When the desktop has ended the worker closes the PAM session
+   (and `pam_end`), says `ended`, runs the cleanup again (which ends every
+   process of the guest and unmounts the home), and only then exits;
+   reclogind brings the login screen back when the worker has exited, as for
+   anyone. A guest worker that went away without finishing its cleanup (or
+   whose cleanup failed) leaves it to a thread in reclogind.
+
+### The cleanup routine
+
+One routine, run at reclogind's start, before every guest login and after
+every guest logout. Each step is safe to repeat. The places are one list at
+the top of `guest.rs`.
+
+1. The guest lock stands for "the guest is logged in": a cleanup never runs
+   while a guest worker holds it (reclogind's own runs skip; the worker runs
+   it under its own hold).
+2. The login service is asked to end user 60600 (**not connected yet**: see
+   `ask_login_service_to_end_user`), then the uid sweep: a helper process
+   drops to uid and gid 60600 (no groups; it checks it really did) and sends
+   `SIGKILL` to every process it may signal; repeated until `/proc` shows no
+   process with real or saved uid 60600 (zombies aside), for up to ten
+   seconds.
+3. Everything mounted at or under `/run/reclogin/guest`, `/run/media/guest`
+   and `/run/user/60600` is unmounted, deepest first; a busy one is detached.
+4. Everything of uid 60600 under `/tmp`, `/var/tmp`, `/dev/shm` and
+   `/dev/mqueue` is removed (a folder of the guest's with all it holds).
+5. Removed whole when present: `/run/reclogin/guest`, `/run/media/guest`,
+   `/run/user/60600`, `/var/spool/cron/guest`,
+   `/var/spool/cron/crontabs/guest`, `/var/lib/systemd/linger/guest`,
+   `/var/lib/elogind/linger/guest`, `/var/lib/AccountsService/users/guest`,
+   `/var/lib/AccountsService/icons/guest`.
+6. System V shared memory, semaphores and message queues whose owner or
+   creator is uid 60600 (`/proc/sysvipc/`) are removed.
+7. The check: no such process, nothing mounted under those places, none of
+   the paths of step 5, nothing of uid 60600 in the places of step 4, no
+   such System V object (shared memory already marked for removal aside).
+   Only then is it "finished completely". Otherwise the mark
+   `/run/reclogin/guest-cleanup-failed` is written (and removed by the next
+   clean pass), and the log says what is left.
+
+Every file walk works from open folder handles (`openat`, `fstatat`,
+`unlinkat`), never follows a link and never leaves the file system it
+started on. It goes 256 folders deep; a deeper tree of the guest's is not
+removed and fails the check.
+
+### Files under dist/ for the guest
+
+| File | Installed as | Design point |
+|---|---|---|
+| `dist/sysusers/reclogin.conf` (the `g guest` and `u guest` lines) | `/usr/lib/sysusers.d/reclogin.conf` | 1, 6 |
+| `dist/pam/reclogin-guest.levitateos`, `dist/pam/reclogin-guest.acornos` | `/etc/pam.d/reclogin-guest` | 4 |
+| `dist/guest/50-reclogin-guest.limits.conf` | `/etc/security/limits.d/50-reclogin-guest.conf` | 3 |
+| `dist/guest/50-reclogin-guest.sshd.conf` | `/etc/ssh/sshd_config.d/50-reclogin-guest.conf` | 4 |
+| `dist/guest/50-reclogin-guest.rules` | `/usr/share/polkit-1/rules.d/50-reclogin-guest.rules` | 1 (decisions 3 and 4) |
+| `dist/guest/reclogin-guest-notice` | `/usr/libexec/reclogin/reclogin-guest-notice`, mode 0755 | 5 |
+| `dist/guest/guest-home/` | `/usr/share/reclogin/guest-home/` (the guest defaults tree; desktop recipes add their own files) | 2, 5 |
 
 ## Starting, restarting, giving up (stage 9)
 
@@ -446,15 +653,29 @@ unconfined and cannot skip it. `--no-sandbox` turns off the items marked *.
 | `dist/systemd/reclogin.service` | LevitateOS. After `systemd-logind`, `dbus`, `systemd-user-sessions`; conflicts with `getty@tty7`; `Alias=display-manager.service`. `Restart=on-failure` but not after status 2 or 3, at most three starts a minute; `KillMode=mixed` so only reclogind gets SIGTERM; `TimeoutStopSec=30` (the stop takes up to fifteen seconds plus the greeter's two); output and errors to the journal; `ExecStopPost` runs `reclogind --reset-console 7`. |
 | `dist/openrc/reclogin` | AcornOS. Needs `elogind` and `dbus`, provides `display-manager`. Starts the wrapper `/usr/libexec/reclogin/reclogind-run` in the foreground, backgrounded and tracked by OpenRC (pid file), never respawned: supervise-daemon cannot leave out a respawn for one exit status. Output to syslog through `logger`. `retry="TERM/30/KILL/5"`. `stop_post` kills a reclogind left behind by a killed wrapper (by the pid the wrapper wrote, never by name) and runs `reclogind --reset-console 7`. |
 | `dist/openrc/reclogind-run` | AcornOS, installed as `/usr/libexec/reclogin/reclogind-run` (mode 0755). OpenRC runs `stop_post` only on a requested stop; the wrapper runs reclogind, passes SIGTERM, SIGINT and SIGHUP on, and after reclogind ended for whatever reason runs `reclogind --reset-console 7` and exits with reclogind's status. Writes reclogind's pid to `/run/reclogin/reclogind.pid`. |
-| `dist/sysusers/reclogin.conf` | The account `reclogin`: a system account, no shell, home `/`, no extra groups. |
+| `dist/sysusers/reclogin.conf` | The account `reclogin`: a system account, no shell, home `/`, no extra groups. The guest account and group (see "The guest"). |
+| `dist/guest/` | The guest's other installed files (see "The guest"). |
 
-Both services start `/usr/bin/reclogind` (OpenRC through the wrapper);
-where stage 10 installs it may change that path. The PAM files (`dist/pam/`) are described under "Logging
+| `dist/reclogin.conf` | The default `/etc/reclogin.conf`: every key, commented out. |
+| `dist/recipe/login-screen.rhai` | The `login-screen` group recipe for both OSes, prepared and not active: it installs the pinned `login-screen` prebuilt and enables the service. `dist/recipe/SWITCH.md` says how it replaces SDDM. |
+
+Both services start `/usr/bin/reclogind` (OpenRC through the wrapper), and
+reclogind starts `/usr/bin/reclogin-greeter` beside it. The OS builder
+compiles the crate per OS in that OS's apps-build root, against its libpam,
+libinput and libxkbcommon (`distro/builder/src/login_screen.rs`), and lays
+out the tree with every file's mode in one list (`installed_files` in
+`distro/builder/os-recipes/reclogin.rhai`): the programs in `/usr/bin`,
+`/etc/pam.d/reclogin` and `reclogin-guest`, `/etc/reclogin.conf`,
+`/usr/lib/sysusers.d/reclogin.conf`, the brand folder `/usr/share/reclogin`
+(`brand.json`, `background.png`, `fonts/` with the `OFL-*.txt` licences,
+`guest-home/`), the guest's files where "Files under dist/ for the guest"
+says, and the systemd unit with its `display-manager.service` link or the
+OpenRC service with its wrapper. The PAM files (`dist/pam/`) are described under "Logging
 in".
 
 ## Not done
 
-Everything of `docs/reclogin-plan.md` after stage 1 except stages 2, 3, 4 and 9:
+Everything of `docs/reclogin-plan.md` after stage 1 except stages 2, 3, 4, 5 and 9:
 
 - stage 2 (above) is written and compile-checked, never run: no PAM module
   of either OS was called, no session was started, no console handed over.
@@ -491,19 +712,55 @@ Everything of `docs/reclogin-plan.md` after stage 1 except stages 2, 3, 4 and 9:
 - stage 4 (above) is written and compile-checked, never run: only
   `--render-png` drew it. The renders are compared with the design files by
   eye and by their markup, not pixel by pixel. Not drawn as the designs do:
-  the Return screen leaves out "Session ..., running since 19:10" (the state
-  has no start time); the key caps of the no-accounts note use the sans face
+  the key caps of the no-accounts note use the sans face
   (no monospace font is in the brand folder); the session menu has no
   scrolling for more sessions than fit. Not confirmed: the AcornOS
   keyboard when only `keymap=` in `/etc/conf.d/loadkeys` was set (it is not
   an XKB layout, so the layout is `us`); how the real Plasma and LXQt session
   files pass `Exec`/`TryExec` (checked against the Desktop Entry
   specification only); a guest is not offered when no account is listed;
-- who is logged in, returning to a session, power actions (stage 5; the
-  system bus is used from there, at `/run/dbus/system_bus_socket`). This
-  includes sessions left running by an earlier reclogind: a restarted one
-  knows nothing of them until stage 5 lists them through the login service;
-- automatic login (stage 6), the guest (stage 7);
+- stage 5 (above) is written and compile-checked, never run: the helper
+  never talked to logind or elogind, nothing was returned to, no power
+  action was asked, the question screens were only rendered. Assumed, not
+  seen: that both services answer `ListSessions`, `GetAll` on the session
+  interface (`Class`, `State`, `VTNr`, `Type`, `Desktop`, `Timestamp` in
+  microseconds), `CanSuspend`/`CanReboot`/`CanPowerOff` and
+  `ActivateSession` as the try of section 10 showed; that a session
+  registered by the PAM module carries the `Desktop` the worker set, and
+  that elogind sets `Timestamp` and emits `PropertiesChanged` (else the
+  five-second re-read carries it); that `ActivateSession` switches the
+  console by `VT_ACTIVATE`, so `SIGUSR1`/`SIGUSR2` reach `reclogind` as for
+  any switch; that `Reboot`/`PowerOff` from root with `interactive=false` is
+  not refused by inhibitors on these images (when it is, the service's
+  reason is shown). Not done: a session without a console (`VTNr` 0) cannot
+  be returned to (said on the screen); only the newest session of a user is
+  returned to; no Hibernate; the guest entry is not marked as logged in and
+  the guest's `TerminateUser` is not on the helper; a power call that hangs
+  holds the helper (not `reclogind`) for up to 25 seconds, and the greeter
+  shows nothing while it waits; after Sleep nothing on the screen says the
+  machine woke; a restart or shut down leaves no "going down" screen;
+- automatic login (stage 6), also to the guest (owner's decision 7): it is
+  to use the same `begin {who: guest}` path, refused when `guest = off`;
+- stage 7 (above) is written and compile-checked, never run: no tmpfs was
+  mounted, no sweep run, no file removed, no PAM module called. Not
+  connected: `TerminateUser(60600)` on `org.freedesktop.login1.Manager`
+  (`ask_login_service_to_end_user` in `guest.rs` logs and does nothing; the
+  uid sweep runs without it); `state.rs` still offers Guest from the setting
+  as known at start (main.rs gives it the setting and the account), not from
+  `guest::offered`, so a cleanup that fails later hides nothing until
+  reclogind restarts (a guest attempt still gets the plain line); "End the
+  guest session" from a locked guest (`guest::end_running_session`, for the
+  stage that returns to sessions) and the Guest entry marked as logged in
+  are not wired. Step 1 of the cleanup asks the guest lock, not the login
+  service: a guest session whose worker and reclogind both died is swept at
+  the next start. Not seen on a real system: `pam_succeed_if`, `pam_permit`,
+  `pam_limits`, `pam_unix` in AcornOS's linux-pam; `pam_systemd` and
+  `pam_elogind` putting `XDG_SESSION_ID` into the PAM environment; whether
+  `DenyUsers` in `sshd_config.d` is read on AcornOS and combines with a
+  `DenyUsers` of the main file; polkit taking an empty admin list as
+  "nobody"; the notice shown by Plasma and LXQt; `/bin/bash` on AcornOS (the
+  session falls back to `/bin/sh` when it is missing; a terminal opened in
+  the session uses the account's shell);
 - the on-screen keyboard, several monitors, idle switch-off, input devices
   plugged in after start (stage 8);
 - stage 9 (above) is written and compile-checked, never run: no greeter
@@ -511,7 +768,9 @@ Everything of `docs/reclogin-plan.md` after stage 1 except stages 2, 3, 4 and 9:
   kernel, the services were not installed, and the Landlock path list was
   not checked against what libinput, its udev library and the loaders
   really open;
-- the per-OS build and shipping (stage 10).
+- shipping (stage 10): the per-OS build, the prebuilt `login-screen` and the
+  prepared group recipe are written, never run; nothing is published and
+  SDDM is still the login screen of both OSes (`dist/recipe/SWITCH.md`).
 
 **Nothing here was run on a console or a display.** It was compile-checked;
 the only thing run was `--render-png`.

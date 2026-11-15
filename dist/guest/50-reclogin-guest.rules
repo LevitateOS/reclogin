@@ -1,0 +1,62 @@
+// Installed as /usr/share/polkit-1/rules.d/50-reclogin-guest.rules (both OSes).
+// docs/reclogin-guest.md, point 1, "What the guest may and may not do", and
+// the owner's decisions 3 (no new WiFi) and 4 (USB drives: mount, unmount,
+// eject only). A deny list (risk R8): an action not named here keeps its
+// own default.
+
+// No administrator is ever asked for inside a guest session: the guest
+// controls every program there, so a password typed in would be given away.
+// (Whether an empty list makes polkit refuse rather than fall back is to be
+// confirmed against polkit's documentation; the deny list holds either way.)
+polkit.addAdminRule(function (action, subject) {
+    if (subject.user == "guest") {
+        return [];
+    }
+});
+
+polkit.addRule(function (action, subject) {
+    if (subject.user != "guest") {
+        return;
+    }
+    var id = action.id;
+    var startsWith = function (prefix) {
+        return id.indexOf(prefix) == 0;
+    };
+
+    // Removable drives: mounting, ejecting, powering off a drive keep udisks2's
+    // own defaults for the active session (unmounting one's own mount needs no
+    // action). Everything else of udisks2 is refused.
+    if (startsWith("org.freedesktop.udisks2.")) {
+        if (id == "org.freedesktop.udisks2.filesystem-mount" ||
+            id == "org.freedesktop.udisks2.eject-media" ||
+            id == "org.freedesktop.udisks2.power-off-drive") {
+            return;
+        }
+        return polkit.Result.NO;
+    }
+
+    // Existing network connections only: no new or changed connection.
+    if (startsWith("org.freedesktop.NetworkManager.settings.modify.")) {
+        return polkit.Result.NO;
+    }
+
+    // Nothing kept running after logout.
+    if (id == "org.freedesktop.login1.set-self-linger" ||
+        id == "org.freedesktop.login1.set-user-linger") {
+        return polkit.Result.NO;
+    }
+
+    // Users, time, language, host name, firmware.
+    if (startsWith("org.freedesktop.accounts.") ||
+        startsWith("org.freedesktop.timedate1.") ||
+        startsWith("org.freedesktop.locale1.") ||
+        startsWith("org.freedesktop.hostname1.") ||
+        startsWith("org.freedesktop.fwupd.")) {
+        return polkit.Result.NO;
+    }
+
+    // The system tools' helpers: Recipe's system scope, recab, the updater.
+    if (startsWith("org.levitateos.")) {
+        return polkit.Result.NO;
+    }
+});

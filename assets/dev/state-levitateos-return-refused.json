@@ -57,7 +57,16 @@
     "row": "kai",
     "notice": [
       "error",
-      "Returning to a running session is not built yet."
-    ]
-  }
+      "The session could not be brought to the front. Session 'c3' not found"
+    ],
+    "running_since": "2026-11-15 19:10"
+  },
+  "running": [
+    {
+      "user": "kai",
+      "name": "Plasma (Wayland)",
+      "console": 8,
+      "since": null
+    }
+  ]
 }

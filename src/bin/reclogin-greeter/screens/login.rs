@@ -442,7 +442,21 @@ pub(super) fn footer(p: &mut Painter, v: &View) {
     let total: f32 = widths.iter().sum::<f32>() + 34.0 * widths.len().saturating_sub(1) as f32;
     let mut x = RIGHT - total;
     for ((icon, label, action), w) in actions.into_iter().zip(widths) {
-        footer_button(p, icon, label, style, x, center);
+        // The action the question is about is marked (the design's
+        // "Shut down" lit and underlined in the accent).
+        let marked = v.form.question == Some(action);
+        let own = if marked {
+            style.with_color(pal.text)
+        } else {
+            style
+        };
+        footer_button(p, icon, label, own, x, center);
+        if marked {
+            p.rule_h(x, row_top + 43.0, w, 1.0, pal.accent);
+        }
+        if v.form.focus == Focus::Power(action) {
+            p.border(x - 8.0, row_top, w + 16.0, 44.0, 1.0, pal.accent);
+        }
         p.hit(x, row_top, w, 44.0, Target::Power(action));
         x += w + 34.0;
     }

@@ -147,7 +147,7 @@ fn start(link: &mut Link) -> Result<(PathBuf, OwnedFd, State)> {
         ),
     };
     let state = match link.next()? {
-        (ToGreeter::State(state), _) => state,
+        (ToGreeter::State(state), _) => *state,
         (other, _) => bail!(
             "expected state, got {}",
             reclogin::protocol::Framed::kind(&other)
@@ -341,7 +341,7 @@ impl Greeter {
             ToGreeter::State(state) => {
                 let layout_changed = state.current_layout != self.state.current_layout
                     || state.layouts != self.state.layouts;
-                self.state = state;
+                self.state = *state;
                 self.form.adopt(&self.state);
                 if layout_changed {
                     if let Some(layout) = self
@@ -374,12 +374,22 @@ impl Greeter {
                 }
             }
             ToGreeter::Message { kind, text } => self.form.talk.messages.push((kind, text)),
+            // A power action was refused or failed: the service's reason,
+            // as the error line (the question, if open, stays).
+            ToGreeter::PowerRefused { text } => {
+                self.form.notice = Some((MessageKind::Error, text));
+            }
             ToGreeter::AuthResult { ok, text } => {
                 self.pending = None;
                 // The answer to a cancel (or the attempt's own end, which
                 // crossed it): the screen is free again.
                 let cancelled = std::mem::take(&mut self.form.cancelling);
                 self.form.finish(ok, text, &self.state);
+                // An answer to `return_to`: success hands the display away
+                // (the screen is not shown any more), so nothing waits.
+                if std::mem::take(&mut self.form.returning) {
+                    self.form.busy = false;
+                }
                 if cancelled {
                     self.form.talk.messages.clear();
                 }
@@ -402,6 +412,8 @@ impl Greeter {
                         "The password was cleared when you left this screen.".into(),
                     ));
                 }
+                // Nor does a question about power wait on it.
+                self.form.close_question(&self.state);
                 self.input.suspend();
                 self.screen.pause();
                 return Next::Continue;
@@ -480,6 +492,10 @@ impl Greeter {
     }
 
     fn press_outside_menu(&mut self, target: Target) {
+        if self.form.question.is_some() {
+            self.press_question(target);
+            return;
+        }
         match target {
             Target::User(i) => {
                 if let Some(user) = self.state.users.get(i) {
@@ -512,9 +528,41 @@ impl Greeter {
                     self.act(Action::NextLayout);
                 }
             }
-            Target::SessionOption(_) | Target::Menu => {}
-            // The on-screen keyboard and power are later stages.
-            Target::OnScreenKeyboard | Target::Power(_) => {}
+            Target::Power(action) => {
+                self.form.focus = Focus::Power(action);
+                if let Some(action) = self.form.press_power(action, &self.state) {
+                    self.act(action);
+                }
+            }
+            Target::SessionOption(_) | Target::Menu | Target::Confirm => {}
+            // The on-screen keyboard is a later stage.
+            Target::OnScreenKeyboard => {}
+        }
+    }
+
+    /// A click while the power question is shown: "… anyway", "Cancel", a
+    /// footer action, or the layout.
+    fn press_question(&mut self, target: Target) {
+        let Some(question) = self.form.question else {
+            return;
+        };
+        match target {
+            Target::Confirm => self.act(Action::Power {
+                action: question,
+                confirmed: true,
+            }),
+            Target::Cancel => self.form.close_question(&self.state),
+            Target::Power(action) => {
+                self.form.focus = Focus::Power(action);
+                if let Some(action) = self.form.press_power(action, &self.state) {
+                    self.act(action);
+                }
+            }
+            Target::Layout if self.state.layouts.len() > 1 => {
+                self.form.focus = Focus::Layout;
+                self.act(Action::NextLayout);
+            }
+            _ => {}
         }
     }
 
@@ -542,6 +590,12 @@ impl Greeter {
             Action::SwitchConsole(number) => self.send(&ToDaemon::SwitchConsole { number }),
             Action::ChooseSession(id) => self.send(&ToDaemon::ChooseSession { id }),
             Action::NextLayout => self.next_layout(),
+            Action::Power { action, confirmed } => {
+                self.form.question = None;
+                self.form.focus = Focus::Power(action);
+                self.form.notice = None;
+                self.send(&ToDaemon::Power { action, confirmed });
+            }
             Action::Cancel => {
                 // Once per attempt. The form stays busy (no new `begin` can
                 // go out) and says it is waiting until reclogind answers with
@@ -570,8 +624,10 @@ impl Greeter {
                 self.form.notice = None;
                 self.form.talk = form::Talk::default();
                 if let Goal::Return(user) = goal {
-                    // Stage 5 builds this; reclogind answers with a message.
+                    // reclogind answers with `auth_result`: ok when the
+                    // session came to the front, else why not.
                     self.form.busy = true;
+                    self.form.returning = true;
                     self.send(&ToDaemon::ReturnTo { user });
                     return;
                 }

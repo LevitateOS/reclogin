@@ -373,6 +373,18 @@ pub fn run(
         tty.give_back();
     };
 
+    // The guest's PAM lines for the login service are optional (one file
+    // for both systems): its session must be seen registered (`guest.rs`).
+    if account.uid == crate::guest::UID && !crate::guest::registered(pam) {
+        log(
+            WHO,
+            "the login service did not register the guest's session; not started",
+        );
+        close(pam);
+        failed();
+        return;
+    }
+
     let mut prepared = match Prepared::new(pam, account, plan) {
         Ok(prepared) => prepared,
         Err(e) => {

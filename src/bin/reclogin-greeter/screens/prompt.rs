@@ -1,9 +1,11 @@
 //! The two screens that have no field: the guest
 //! (`docs/reclogin-design/AcornGuest.dc.html`) and returning to a person's
 //! running session (`docs/reclogin-design/LevitateReturn.dc.html`). A
-//! headline, a few lines saying what the button does, and the button. What
-//! reclogind answers (it may not be able to yet) shows under the lines as
-//! the error line does on the login screen. Positions and sizes are the
+//! headline, a few lines saying what the button does, and the button. The
+//! return screen also says which session runs and since when ("Session
+//! Plasma (Wayland), running since 19:10", from the state's `running`). Why
+//! reclogind could not do what the button asks shows under the lines as the
+//! error line does on the login screen. Positions and sizes are the
 //! designs', in 1920×1080 units.
 
 use super::login::{
@@ -11,6 +13,9 @@ use super::login::{
     list_height, session_menu, Line, View, FOOTER_H, FORM_W, FORM_X, HEIGHT, TOP,
 };
 use super::Screen;
+use chrono::{DateTime, Datelike, Local, TimeZone};
+use reclogin::protocol::RunningSession;
+
 use crate::paint::text::{Face, Style};
 use crate::paint::Painter;
 
@@ -98,7 +103,25 @@ pub fn draw(p: &mut Painter, v: &View) {
             )
         })
         .collect();
-    let texts_h: f32 = laid.iter().map(|l| l.height).sum::<f32>() + 12.0 * (laid.len() - 1) as f32;
+    // "Session   Plasma (Wayland), running since 19:10", on the return screen.
+    let session_line = (screen == Screen::Return)
+        .then(|| {
+            v.form
+                .chosen(v.state)
+                .and_then(|(_, u)| running_text(v, &u.name))
+        })
+        .flatten()
+        .map(|text| {
+            (
+                p.lay(&[("Session", sans(15.0, pal.text_muted))], None, false),
+                p.lay(&[(&text, sans(15.0, pal.text_secondary))], None, false),
+            )
+        });
+    let texts_h: f32 = laid.iter().map(|l| l.height).sum::<f32>()
+        + 12.0 * (laid.len() - 1) as f32
+        + session_line
+            .as_ref()
+            .map_or(0.0, |(label, value)| 12.0 + label.height.max(value.height));
     let lines: Vec<Line> = form_lines(v, false)
         .into_iter()
         .filter(|l| !matches!(l, Line::Caps))
@@ -124,11 +147,62 @@ pub fn draw(p: &mut Painter, v: &View) {
         p.put(text, FORM_X, y);
         y += text.height;
     }
+    if let Some((label, value)) = &session_line {
+        y += 12.0;
+        let h = label.height.max(value.height);
+        p.put(label, FORM_X, y + (h - label.height) / 2.0);
+        p.put(
+            value,
+            FORM_X + label.width + 10.0,
+            y + (h - value.height) / 2.0,
+        );
+        y += h;
+    }
     let y = draw_lines(p, &lines, &heights, y);
 
     let menu = action_row(p, v, y + 30.0, &button);
     footer(p, v);
     if let Some(menu) = menu {
         session_menu(p, v, menu);
+    }
+}
+
+/// What the return screen says of a user's session: the desktop and since
+/// when. The newest session of `user` when there are several. `None` when
+/// the login service told nothing about it.
+fn running_text(v: &View, user: &str) -> Option<String> {
+    let session: &RunningSession = v
+        .state
+        .running
+        .iter()
+        .filter(|s| s.user == user)
+        .max_by_key(|s| s.since.unwrap_or(0))?;
+    let since = session
+        .since
+        .and_then(|t| Local.timestamp_opt(t, 0).single())
+        .map(|at| since_text(&v.clock.now, &at, v.state.clock_24h));
+    match (session.name.trim(), since) {
+        ("", None) => None,
+        ("", Some(since)) => Some(format!("Running since {since}")),
+        (name, None) => Some(name.to_string()),
+        (name, Some(since)) => Some(format!("{name}, running since {since}")),
+    }
+}
+
+/// "19:10" for today, "yesterday 19:10", else "13 Nov 19:10".
+fn since_text(now: &DateTime<Local>, at: &DateTime<Local>, hour_24: bool) -> String {
+    let time = if hour_24 {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%-I:%M %p").to_string()
+    };
+    let today = now.date_naive();
+    let day = at.date_naive();
+    if day == today {
+        time
+    } else if today.pred_opt() == Some(day) {
+        format!("yesterday {time}")
+    } else {
+        format!("{} {} {time}", day.day(), at.format("%b"))
     }
 }

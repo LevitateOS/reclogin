@@ -6,14 +6,16 @@
 //! would leave it in: a failed attempt (`notice`, `caps_lock`), or further
 //! questions (`messages`, `fields`), or on another screen: `row` (`"guest"`,
 //! `"other"` or a user name), `user_name`, `focus`, `menu` (the session menu
-//! open). See `assets/dev/state-*.json`.
+//! open), `question` (the power question, `restart` or `shut_down`) and
+//! `running_since` (when the running sessions started, local time). See
+//! `assets/dev/state-*.json`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDateTime, TimeZone};
 use reclogin::brand::Brand;
-use reclogin::protocol::{Layout, MessageKind, Power, PromptKind, State, User};
+use reclogin::protocol::{Layout, MessageKind, Power, PowerAction, PromptKind, State, User};
 use serde::Deserialize;
 use tiny_skia::Pixmap;
 
@@ -45,6 +47,11 @@ struct Sample {
     focus: Option<String>,
     /// The session menu is open.
     menu: bool,
+    /// The power question is open for this action: `restart` or `shut_down`.
+    question: Option<String>,
+    /// Every running session started at this local time, `YYYY-MM-DD HH:MM`
+    /// (the file's `since` would depend on the machine's time zone).
+    running_since: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -107,6 +114,7 @@ fn sample_state() -> State {
         },
         guest_offered: true,
         others_logged_in: vec!["kai".into()],
+        running: Vec::new(),
         clock_24h: true,
         idle_seconds: None,
     }
@@ -139,7 +147,7 @@ fn read_state(path: &Path) -> Result<(State, Option<Sample>)> {
 pub fn render(options: &Options) -> Result<()> {
     let brand = Brand::load(&options.brand_dir)?;
     let mut look = Look::load(brand)?;
-    let (state, sample) = match &options.state {
+    let (mut state, sample) = match &options.state {
         Some(path) => read_state(path)?,
         None => (sample_state(), None),
     };
@@ -154,6 +162,17 @@ pub fn render(options: &Options) -> Result<()> {
         }
         None => Local::now(),
     };
+    if let Some(text) = sample.as_ref().and_then(|s| s.running_since.as_ref()) {
+        let naive = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M")
+            .context("the sample's running_since is YYYY-MM-DD HH:MM")?;
+        let at = Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .context("the sample's running_since is not a local time")?;
+        for running in &mut state.running {
+            running.since = Some(at.timestamp());
+        }
+    }
     let mut form = Form::new(&state);
     let mut typed = options.typed;
     if let Some(sample) = sample {
@@ -179,8 +198,21 @@ pub fn render(options: &Options) -> Result<()> {
                 "session" => Focus::Session,
                 "layout" => Focus::Layout,
                 "log_in" => Focus::LogIn,
-                other => bail!("the sample's focus {other:?} is not one of users, user_name, password, session, layout, log_in"),
+                "confirm" => Focus::Confirm,
+                "cancel" => Focus::Cancel,
+                "sleep" => Focus::Power(PowerAction::Sleep),
+                "restart" => Focus::Power(PowerAction::Restart),
+                "shut_down" => Focus::Power(PowerAction::ShutDown),
+                other => bail!("the sample's focus {other:?} is not one of users, user_name, password, session, layout, log_in, confirm, cancel, sleep, restart, shut_down"),
             };
+        }
+        if let Some(question) = &sample.question {
+            let action = match question.as_str() {
+                "restart" => PowerAction::Restart,
+                "shut_down" => PowerAction::ShutDown,
+                other => bail!("the sample's question {other:?} is not restart or shut_down"),
+            };
+            form.question = Some(action);
         }
         form.notice = sample.notice;
         form.caps_lock = sample.caps_lock;

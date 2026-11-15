@@ -76,6 +76,9 @@ pub enum ToWorker {
         session: SessionRef,
         console: u32,
     },
+    /// First message of a guest login instead of `start` (`guest.rs`): the
+    /// account `guest`, PAM's `reclogin-guest` service, no conversation.
+    StartGuest { session: SessionRef, console: u32 },
     /// The answer to the last `Prompt`: the next packet is the secret, raw.
     Answer,
     /// Abandon the login; or, once the session runs, end it.
@@ -87,6 +90,10 @@ pub enum ToWorker {
 pub enum Command {
     Start {
         user: String,
+        session: SessionRef,
+        console: u32,
+    },
+    StartGuest {
         session: SessionRef,
         console: u32,
     },
@@ -111,6 +118,9 @@ pub fn receive(channel: &Channel) -> io::Result<Option<Command>> {
             session,
             console,
         }),
+        Some((ToWorker::StartGuest { session, console }, _)) => {
+            Some(Command::StartGuest { session, console })
+        }
         Some((ToWorker::Answer, _)) => channel.recv_secret()?.map(Command::Answer),
         Some((ToWorker::Cancel, _)) => Some(Command::Cancel),
     })
@@ -120,6 +130,7 @@ impl Command {
     pub fn kind(&self) -> &'static str {
         match self {
             Command::Start { .. } => "start",
+            Command::StartGuest { .. } => "start_guest",
             Command::Answer(_) => "answer",
             Command::Cancel => "cancel",
         }
@@ -159,6 +170,7 @@ impl Framed for ToWorker {
     fn kind(&self) -> &'static str {
         match self {
             ToWorker::Start { .. } => "start",
+            ToWorker::StartGuest { .. } => "start_guest",
             ToWorker::Answer => "answer",
             ToWorker::Cancel => "cancel",
         }
@@ -198,6 +210,8 @@ pub struct Talk<'a> {
     /// Messages held back while the account is checked, so that "Current
     /// password accepted." can come before them when the password expired.
     held: Option<Vec<(MessageKind, String)>>,
+    /// The guest's login (`guest.rs`): no question is ever answered.
+    silent: bool,
 }
 
 impl<'a> Talk<'a> {
@@ -207,6 +221,16 @@ impl<'a> Talk<'a> {
             cancelled: false,
             spoke_error: false,
             held: None,
+            silent: false,
+        }
+    }
+
+    /// For the guest's PAM service, which has no password conversation: a
+    /// question from any module is refused, which fails that step.
+    pub fn silent(channel: &'a Channel) -> Talk<'a> {
+        Talk {
+            silent: true,
+            ..Talk::new(channel)
         }
     }
 
@@ -240,6 +264,13 @@ impl<'a> Talk<'a> {
 impl Conversation for Talk<'_> {
     fn ask(&mut self, kind: PromptKind, text: &str) -> Option<Secret> {
         if self.cancelled {
+            return None;
+        }
+        if self.silent {
+            log(
+                WHO,
+                "a question in the guest's PAM service was refused: it has no conversation",
+            );
             return None;
         }
         self.release();
@@ -342,10 +373,20 @@ fn serve() -> Result<()> {
             session,
             console,
         }) => (user, session, console),
+        Some(Command::StartGuest { session, console }) => {
+            return crate::guest::worker_login(&channel, &signals, &session, console);
+        }
         Some(other) => bail!("expected start, got {}", other.kind()),
         None => return Ok(()),
     };
     let fail = |text: &str| channel.send(&FromWorker::Failed { text: text.into() }, &[]);
+
+    // The guest logs in only through `start_guest` and its own service.
+    if user == crate::guest::NAME {
+        log(WHO, "the guest through the normal PAM service refused");
+        fail(AUTH_FAILED)?;
+        return Ok(());
+    }
 
     // What to run, before anyone types a password for it.
     let plan = match session::read(&session) {
@@ -434,6 +475,14 @@ fn serve() -> Result<()> {
             return Ok(());
         }
     };
+    if account.uid == crate::guest::UID {
+        log(
+            WHO,
+            "the guest's uid through the normal PAM service refused",
+        );
+        fail(AUTH_FAILED)?;
+        return Ok(());
+    }
 
     channel.send(&FromWorker::Accepted, &[])?;
     session::run(&mut pam, &account, &plan, console, &channel, &signals);

@@ -62,7 +62,7 @@ pub enum ToGreeter {
     DeviceRefused { request_id: u64, reason: String },
     /// Everything the screen shows that comes from the system. Sent at start
     /// and again whenever it changes; the newest one replaces the others.
-    State(State),
+    State(Box<State>),
     /// A question from PAM. The greeter shows `text` word for word and
     /// answers with `Answer { prompt_id: id, .. }`.
     Prompt {
@@ -72,6 +72,10 @@ pub enum ToGreeter {
     },
     /// A message from PAM or from reclogind, shown word for word, in order.
     Message { kind: MessageKind, text: String },
+    /// A power action was refused or failed; `text` is the login service's
+    /// reason (or reclogind's), shown as an error line. Nothing is sent when
+    /// an action went through.
+    PowerRefused { text: String },
     /// The end of a login attempt. `ok: false` returns to the login screen
     /// with `text` (if not empty) as the error line.
     AuthResult { ok: bool, text: String },
@@ -105,6 +109,7 @@ impl Framed for ToGreeter {
             ToGreeter::State(_) => "state",
             ToGreeter::Prompt { .. } => "prompt",
             ToGreeter::Message { .. } => "message",
+            ToGreeter::PowerRefused { .. } => "power_refused",
             ToGreeter::AuthResult { .. } => "auth_result",
             ToGreeter::Pause => "pause",
             ToGreeter::Resume => "resume",
@@ -157,6 +162,11 @@ pub struct State {
     /// User names with a running session (for the power question).
     #[serde(default)]
     pub others_logged_in: Vec<String>,
+    /// The running sessions on this seat (what the login service says), for
+    /// the return screen's "Session Plasma (Wayland), running since 19:10".
+    /// Empty while the login service cannot be reached.
+    #[serde(default)]
+    pub running: Vec<RunningSession>,
     /// Clock style from the system's language and region.
     #[serde(default = "default_true")]
     pub clock_24h: bool,
@@ -177,6 +187,23 @@ pub struct User {
     pub real_name: String,
     #[serde(default)]
     pub logged_in: bool,
+}
+
+/// A user's running session, as the login service reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunningSession {
+    /// The account name (`User::name`).
+    pub user: String,
+    /// The desktop's name for the screen ("Plasma (Wayland)", "Text
+    /// console"); empty when nothing can be said.
+    #[serde(default)]
+    pub name: String,
+    /// The console it runs on.
+    #[serde(default)]
+    pub console: u32,
+    /// When it started, seconds since the epoch, when the service says.
+    #[serde(default)]
+    pub since: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

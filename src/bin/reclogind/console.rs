@@ -77,9 +77,12 @@ fn ioctl_value(fd: &File, request: libc::c_ulong, value: libc::c_int) -> io::Res
 }
 
 impl Console {
-    /// Take console `number`: switch to it, put it in graphics mode with the
-    /// kernel's keyboard handling off, and switch consoles by signal.
-    pub fn take(number: u32) -> Result<Console> {
+    /// Take console `number`: switch to it (when `switch`), put it in
+    /// graphics mode with the kernel's keyboard handling off, and switch
+    /// consoles by signal. With `switch` false the console shown stays shown
+    /// (it belongs to a running user session); ours is taken without being
+    /// shown, and the kernel tells us when it is (`ACQUIRE_SIGNAL`).
+    pub fn take(number: u32, switch: bool) -> Result<Console> {
         if !(1..=63).contains(&number) {
             bail!("console {number} does not exist (1 to 63)");
         }
@@ -119,6 +122,7 @@ impl Console {
             console.tty0.as_raw_fd(),
             keyboard_mode,
             console.previous,
+            number,
         );
 
         let mode = VtMode {
@@ -131,14 +135,17 @@ impl Console {
         if unsafe { libc::ioctl(console.tty.as_raw_fd(), VT_SETMODE as _, &mode) } < 0 {
             return Err(io::Error::last_os_error()).context("switching consoles by signal");
         }
-        console.show(number).context("showing the login console")?;
+        if switch {
+            console.show(number).context("showing the login console")?;
+        }
         ioctl_value(&console.tty, KDSETMODE, KD_GRAPHICS).context("console to graphics mode")?;
         ioctl_value(&console.tty, KDSKBMODE, K_OFF).context("console keyboard off")?;
         log(
             "reclogind",
             format_args!(
-                "took console {number} (console {} was shown)",
-                console.previous
+                "took console {number} (console {} was shown{})",
+                console.previous,
+                if switch { "" } else { ", and stays shown" }
             ),
         );
         Ok(console)
@@ -202,7 +209,12 @@ impl Console {
             ioctl_value(&self.tty, KDSKBMODE, self.keyboard_mode),
         );
         step("text mode", ioctl_value(&self.tty, KDSETMODE, KD_TEXT));
-        if self.previous != 0 && self.previous != self.number {
+        // Only from our own console: when another one is shown (a user's
+        // session, say) the display is not taken away from it.
+        if self.previous != 0
+            && self.previous != self.number
+            && active_of(self.tty0.as_raw_fd()) == Some(self.number)
+        {
             step("showing the first console", self.show(self.previous));
         }
     }
@@ -217,7 +229,7 @@ impl Drop for Console {
 /// The last resort, for a panic, a fatal signal or `--reset-console`: the
 /// steps of [`Console::restore`] from plain numbers, each tried, without
 /// waiting for the switch. Only system calls, so safe in a signal handler.
-pub fn restore_raw(tty: RawFd, tty0: RawFd, keyboard_mode: libc::c_int, show: u32) {
+pub fn restore_raw(tty: RawFd, tty0: RawFd, keyboard_mode: libc::c_int, show: u32, own: u32) {
     let mode = VtMode {
         mode: VT_AUTO,
         waitv: 0,
@@ -229,10 +241,33 @@ pub fn restore_raw(tty: RawFd, tty0: RawFd, keyboard_mode: libc::c_int, show: u3
         libc::ioctl(tty, VT_SETMODE as _, &mode);
         libc::ioctl(tty, KDSKBMODE as _, keyboard_mode as libc::c_long);
         libc::ioctl(tty, KDSETMODE as _, KD_TEXT as libc::c_long);
-        if show != 0 {
+        // Only from our own console (`own`, or any when it is not known):
+        // another one that is shown is left shown.
+        if show != 0 && (own == 0 || active_of(tty0) == Some(own)) {
             libc::ioctl(tty0, VT_ACTIVATE as _, show as libc::c_long);
         }
     }
+}
+
+/// The console shown, asked through the open `/dev/tty0`. Only system
+/// calls, so safe in a signal handler.
+fn active_of(tty0: RawFd) -> Option<u32> {
+    let mut state = VtStat::default();
+    if unsafe { libc::ioctl(tty0, VT_GETSTATE as _, &mut state) } < 0 {
+        return None;
+    }
+    Some(u32::from(state.v_active))
+}
+
+/// The console shown now, or `None` when it cannot be asked.
+pub fn active_console() -> Option<u32> {
+    let tty0 = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open("/dev/tty0")
+        .ok()?;
+    active_of(tty0.as_raw_fd())
 }
 
 /// Whether the console open as `tty` is in graphics mode.
