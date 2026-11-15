@@ -47,7 +47,9 @@ const ARCH_X86_64: u32 = 0xC000_003E;
 const X32_BIT: u32 = 0x4000_0000;
 
 /// Refuse every new socket: `socket`, `socketpair`, `connect`, `bind`,
-/// `listen`, `accept` and `accept4` fail with `EACCES`. The network
+/// `listen`, `accept` and `accept4` fail with `EACCES`; `io_uring_setup`,
+/// `io_uring_enter` and `io_uring_register` fail with `ENOSYS`, since a ring
+/// makes sockets and connects without those calls. The network
 /// namespace already has no network; this also closes the Unix sockets in
 /// the file system (the system bus, the log sockets) and abstract ones on
 /// kernels whose Landlock does not. `sendmsg` and `recvmsg` stay allowed, so
@@ -73,13 +75,16 @@ pub fn no_new_sockets() -> Result<()> {
     };
     let jump = |code: u16, k: u32, jt: u8, jf: u8| sock_filter { code, jt, jf, k };
     let refused = [
-        libc::SYS_socket,
-        libc::SYS_socketpair,
-        libc::SYS_connect,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
+        (libc::SYS_socket, libc::EACCES),
+        (libc::SYS_socketpair, libc::EACCES),
+        (libc::SYS_connect, libc::EACCES),
+        (libc::SYS_bind, libc::EACCES),
+        (libc::SYS_listen, libc::EACCES),
+        (libc::SYS_accept, libc::EACCES),
+        (libc::SYS_accept4, libc::EACCES),
+        (libc::SYS_io_uring_setup, libc::ENOSYS),
+        (libc::SYS_io_uring_enter, libc::ENOSYS),
+        (libc::SYS_io_uring_register, libc::ENOSYS),
     ];
     let mut filter = vec![
         stmt(LD_W_ABS, SECCOMP_ARCH),
@@ -89,20 +94,16 @@ pub fn no_new_sockets() -> Result<()> {
         jump(JGE_K, X32_BIT, 0, 1),
         stmt(RET_K, libc::SECCOMP_RET_KILL_PROCESS),
     ];
-    // Each refused number jumps to the EACCES return after the list; the
-    // last one falls through to "allow" when it does not match.
-    let n = refused.len();
-    for (i, nr) in refused.iter().enumerate() {
-        // Instructions left after this one before the EACCES return: the
-        // remaining comparisons and the allow.
-        let to_refuse = (n - i) as u8;
-        filter.push(jump(JEQ_K, *nr as u32, to_refuse, 0));
+    // Each refused number: if it matches, the next instruction returns its
+    // error; otherwise that return is skipped. After the list: allow.
+    for (nr, errno) in refused {
+        filter.push(jump(JEQ_K, nr as u32, 0, 1));
+        filter.push(stmt(
+            RET_K,
+            libc::SECCOMP_RET_ERRNO | (errno as u32 & libc::SECCOMP_RET_DATA),
+        ));
     }
     filter.push(stmt(RET_K, libc::SECCOMP_RET_ALLOW));
-    filter.push(stmt(
-        RET_K,
-        libc::SECCOMP_RET_ERRNO | (libc::EACCES as u32 & libc::SECCOMP_RET_DATA),
-    ));
     let program = sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_mut_ptr(),

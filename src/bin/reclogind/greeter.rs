@@ -8,8 +8,16 @@
 //! The rest of its lock-down (no network, no capabilities, limits, a
 //! read-only view of its data through Landlock) is in [`crate::sandbox`],
 //! applied here between fork and exec unless `--no-sandbox` was given.
+//!
+//! Liveness: a greeter has a minute from getting its display and state to
+//! say `ready` (fonts and the first mode set are slow on slow machines);
+//! pings, and the five-second limit on a socket it does not read, start
+//! from `ready`. While the login console is not shown none of it runs.
+//!
+//! While the login console is not shown the greeter is obeyed in nothing
+//! that acts ([`Daemon::refuse_while_paused`]).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -20,12 +28,14 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use reclogin::protocol::{Framed, GREETER_SOCKET_ENV, GREETER_SOCKET_FD};
+use reclogin::log;
+use reclogin::protocol::{Framed, ToDaemon, ToGreeter, GREETER_SOCKET_ENV, GREETER_SOCKET_FD};
 use reclogin::wire::Channel;
 use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::sandbox;
+use crate::{Daemon, Next, WHO};
 
 /// How every greeter is started; set once by [`configure`].
 pub struct Settings {
@@ -60,6 +70,12 @@ const STUCK_AFTER: Duration = Duration::from_secs(5);
 const PING_EVERY: Duration = Duration::from_secs(3);
 /// How long it has to answer.
 const PONG_WITHIN: Duration = Duration::from_secs(10);
+/// How long a greeter with its display and state has to say `ready`.
+const READY_WITHIN: Duration = Duration::from_secs(60);
+/// The longest PAM or service text sent, in characters; JSON escaping can
+/// make a character six bytes, so this keeps any text far below the packet
+/// limit.
+const TEXT_MAX: usize = 2000;
 
 pub struct Greeter {
     pub child: Child,
@@ -74,6 +90,14 @@ pub struct Greeter {
     /// The ping not answered yet and when it was sent.
     ping: Option<(u64, Instant)>,
     next_ping: Instant,
+    /// It said `ready` (after its first frame): pings run from then on.
+    ready: bool,
+    /// Since when it has its display and state and the login console is
+    /// shown, while it is not ready yet.
+    starting_since: Option<Instant>,
+    /// The kinds of message refused while the login console was not shown,
+    /// each logged once until it is shown again.
+    refused: HashSet<&'static str>,
 }
 
 impl Greeter {
@@ -126,9 +150,19 @@ impl Greeter {
         Ok(())
     }
 
-    /// Why the greeter counts as hung now, if it does: its queue has not
+    /// Why the greeter counts as hung now, if it does: not ready a minute
+    /// after it had its display and state; once ready, its queue has not
     /// moved for five seconds, or a ping was not answered within ten.
     pub fn hung(&self, now: Instant) -> Option<&'static str> {
+        if !self.ready {
+            if self
+                .starting_since
+                .is_some_and(|t| now.duration_since(t) >= READY_WITHIN)
+            {
+                return Some("was not ready within a minute of getting its display");
+            }
+            return None;
+        }
         if self
             .stuck_since
             .is_some_and(|t| now.duration_since(t) >= STUCK_AFTER)
@@ -146,7 +180,7 @@ impl Greeter {
 
     /// The ping to send now, if one is due (none while one is unanswered).
     pub fn ping_due(&mut self, now: Instant) -> Option<u64> {
-        if self.ping.is_some() || now < self.next_ping {
+        if !self.ready || self.ping.is_some() || now < self.next_ping {
             return None;
         }
         self.next_seq += 1;
@@ -162,16 +196,47 @@ impl Greeter {
         }
     }
 
-    /// The login console was left: no pings until it is shown again.
+    /// The login console was left: no pings, and no start-up limit, until
+    /// it is shown again.
     pub fn stop_pinging(&mut self) {
         self.ping = None;
         self.next_ping = Instant::now() + PING_EVERY;
+        self.starting_since = None;
+    }
+
+    /// It has its display and state, on the shown login console: the
+    /// minute to get ready starts.
+    pub fn handshake_done(&mut self) {
+        if !self.ready {
+            self.starting_since = Some(Instant::now());
+        }
+    }
+
+    /// The login console is shown again and the greeter resumed.
+    pub fn shown_again(&mut self) {
+        self.refused.clear();
+        self.next_ping = Instant::now() + PING_EVERY;
+        if !self.ready {
+            self.starting_since = Some(Instant::now());
+        }
+    }
+
+    /// `ready` arrived: liveness counting starts.
+    pub fn mark_ready(&mut self) {
+        if !self.ready {
+            self.ready = true;
+            self.starting_since = None;
+            self.next_ping = Instant::now() + PING_EVERY;
+        }
     }
 
     /// The next moment `tick` has something to check for this greeter;
     /// `pinging`: whether pings are sent now (the login console is shown).
     /// `None`: nothing.
     pub fn next_deadline(&self, pinging: bool) -> Option<Instant> {
+        if !self.ready {
+            return self.starting_since.map(|t| t + READY_WITHIN);
+        }
         let ping = match self.ping {
             Some((_, sent)) => Some(sent + PONG_WITHIN),
             None => pinging.then_some(self.next_ping),
@@ -319,6 +384,9 @@ pub fn start_with(program: &Path, account_name: &str, settings: &Settings) -> Re
         next_seq: 0,
         ping: None,
         next_ping: Instant::now() + PING_EVERY,
+        ready: false,
+        starting_since: None,
+        refused: HashSet::new(),
     };
     if let Err(e) = greeter.channel.set_nonblocking() {
         let _ = greeter.child.kill();
@@ -326,4 +394,109 @@ pub fn start_with(program: &Path, account_name: &str, settings: &Settings) -> Re
         return Err(e).context("making the greeter's socket non-blocking");
     }
     Ok(greeter)
+}
+
+/// `message` with its text cut to [`TEXT_MAX`] characters (at a character
+/// boundary) when it is longer; `None` when nothing needed cutting. PAM's
+/// questions and messages, and the reasons from the login service, are
+/// shown word for word otherwise.
+pub fn fit_text(message: &ToGreeter) -> Option<ToGreeter> {
+    let long = |text: &str| text.chars().nth(TEXT_MAX).is_some();
+    let fitted = match message {
+        ToGreeter::Prompt { id, kind, text } if long(text) => ToGreeter::Prompt {
+            id: *id,
+            kind: *kind,
+            text: cut(text, TEXT_MAX),
+        },
+        ToGreeter::Message { kind, text } if long(text) => ToGreeter::Message {
+            kind: *kind,
+            text: cut(text, TEXT_MAX),
+        },
+        ToGreeter::AuthResult { ok, text } if long(text) => ToGreeter::AuthResult {
+            ok: *ok,
+            text: cut(text, TEXT_MAX),
+        },
+        ToGreeter::PowerRefused { text } if long(text) => ToGreeter::PowerRefused {
+            text: cut(text, TEXT_MAX),
+        },
+        _ => return None,
+    };
+    log(
+        WHO,
+        format_args!(
+            "the text of a {} was cut to {TEXT_MAX} characters",
+            message.kind()
+        ),
+    );
+    Some(fitted)
+}
+
+/// `text` cut to `max` characters, at a character boundary.
+pub fn cut(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => text[..end].to_string(),
+        None => text.to_string(),
+    }
+}
+
+const NOT_SHOWN: &str = "The login screen is not shown.";
+
+impl Daemon {
+    /// A message from a greeter while the login console is not shown: only
+    /// `pong`, `ready` and `close_device` are obeyed, and `cancel` (it can
+    /// only end the greeter's own login attempt, and a cancel that crossed
+    /// the pause must not leave that attempt running). `answer` is let
+    /// through renamed to a question that does not exist, so that its raw
+    /// secret packet is read and dropped. Everything else is refused, logged
+    /// once per kind until the console is shown again, and answered where
+    /// the greeter waits for an answer.
+    pub(crate) fn refuse_while_paused(&mut self, message: ToDaemon) -> Result<ToDaemon, Next> {
+        let kind = message.kind();
+        let refuse_log = |this: &mut Daemon| {
+            if this.greeter.refused.insert(kind) {
+                log(
+                    WHO,
+                    format_args!("{kind} from the greeter refused: the login console is not shown"),
+                );
+            }
+        };
+        match message {
+            ToDaemon::Pong { .. }
+            | ToDaemon::Ready
+            | ToDaemon::CloseDevice { .. }
+            | ToDaemon::Cancel => Ok(message),
+            ToDaemon::Answer { .. } => {
+                refuse_log(self);
+                Ok(ToDaemon::Answer {
+                    prompt_id: u64::MAX,
+                })
+            }
+            ToDaemon::OpenDevice { request_id, .. } => {
+                refuse_log(self);
+                Err(self.send(&ToGreeter::DeviceRefused {
+                    request_id,
+                    reason: "the login console is not shown".into(),
+                }))
+            }
+            ToDaemon::Begin { .. } | ToDaemon::ReturnTo { .. } | ToDaemon::EndGuest => {
+                refuse_log(self);
+                Err(self.send(&ToGreeter::AuthResult {
+                    ok: false,
+                    text: NOT_SHOWN.into(),
+                }))
+            }
+            ToDaemon::Power { .. } => {
+                refuse_log(self);
+                Err(self.send(&ToGreeter::PowerRefused {
+                    text: NOT_SHOWN.into(),
+                }))
+            }
+            ToDaemon::ChooseSession { .. }
+            | ToDaemon::SetLayout { .. }
+            | ToDaemon::SwitchConsole { .. } => {
+                refuse_log(self);
+                Err(Next::Continue)
+            }
+        }
+    }
 }

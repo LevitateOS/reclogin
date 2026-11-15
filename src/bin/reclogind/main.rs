@@ -9,6 +9,7 @@
 //! the front, through the helper `reclogind --login-service`, `loginhelper`),
 //! `guest`, `autologin`.
 
+mod autologin;
 mod console;
 mod display;
 mod greeter;
@@ -20,6 +21,7 @@ mod last;
 mod login;
 mod logind;
 mod loginhelper;
+mod nosetid;
 mod pam;
 mod sandbox;
 mod session;
@@ -120,6 +122,15 @@ fn main() -> ExitCode {
     // in USAGE.
     if std::env::args().nth(1).as_deref() == Some(logind::SWITCH) {
         return loginhelper::run();
+    }
+    // Started by the guest's cleanup (`guest.rs`) for one call; not in USAGE.
+    if std::env::args().nth(1).as_deref() == Some(loginhelper::END_USER) {
+        return loginhelper::end_user();
+    }
+    // The guest's cleanup, started by reclogind with the guest lock
+    // (`guest.rs`); not in USAGE.
+    if std::env::args().nth(1).as_deref() == Some(guest::CLEANUP_SWITCH) {
+        return guest::cleanup_child();
     }
     if let Some(code) = supervise::reset_console_mode() {
         return code;
@@ -222,8 +233,8 @@ fn run(options: Options) -> Result<()> {
     for problem in &loaded.problems {
         log(WHO, problem);
     }
-    // The guest's cleanup, before the screen can show the Guest entry
-    // (`guest.rs`).
+    // The guest's setting and account (`guest.rs`); its cleanup starts
+    // below, and the screen offers Guest only once it finished clean.
     let guest = guest::at_start(&loaded.config);
 
     // The login service first (its helper has a moment to report): a console
@@ -231,14 +242,19 @@ fn run(options: Options) -> Result<()> {
     let logind = logind::Service::start();
     let active = console::active_console();
     let take_over = !active.is_some_and(|n| logind.session_on(n));
+    // The display before the console: at boot its driver may still be
+    // loading, and the console shown stays usable while we wait for it.
+    let display = Display::open_waiting()?;
     // Every early return below drops `console`, which gives it back.
     let mut console = Console::take(options.console, take_over)?;
-    let display = Display::open()?;
     if take_over {
         display
             .take()
             .with_context(|| format!("becoming the master of {}", display.path))?;
     } else {
+        // Opening it may have made us its master (a text console in
+        // front): a desktop started from there must be able to have it.
+        display.give_up_quietly();
         log(
             WHO,
             "a user session's console is shown; the login screen waits until its console is shown",
@@ -280,6 +296,12 @@ fn run(options: Options) -> Result<()> {
         logind,
     };
     daemon.login.guest = guest;
+    // The guest's cleanup at start, in a child process (`guest.rs`), before
+    // the automatic login (which, for the guest, waits for it).
+    daemon.start_guest_cleanup("at start");
+    // Automatic login, once, now that the greeter is up to show a failure
+    // (`autologin.rs`).
+    daemon.start_autologin(&loaded.config, take_over);
     if !take_over {
         // The session in front: when it ends and nothing else is shown, the
         // login console is (`logind.rs`).
@@ -345,8 +367,18 @@ impl Daemon {
             }
             let generation = self.supervisor.generation;
             if fds[0].revents != 0 {
+                let mut console_signal = false;
                 while let Some(signal) = next_signal(signals) {
+                    console_signal |=
+                        signal == console::RELEASE_SIGNAL || signal == console::ACQUIRE_SIGNAL;
                     if let Next::Stop = self.on_signal(signal) {
+                        return Ok(());
+                    }
+                }
+                // Which console is shown decides, not the signals' order
+                // (`console.rs`).
+                if console_signal {
+                    if let Next::Stop = self.console_changed() {
                         return Ok(());
                     }
                 }
@@ -406,8 +438,38 @@ impl Daemon {
     /// Never waits: a message the socket cannot take now is queued
     /// (`Greeter::send`), and a greeter that stops reading is hung (`tick`).
     fn send(&mut self, message: &ToGreeter) -> Next {
+        // A greeter still waiting for its display and state gets nothing
+        // else: what is sent meanwhile belonged to the greeter it replaced
+        // (an `auth_result`, a power answer) or is renewed by the handshake
+        // (the state, pause and resume). The line kept for the next screen
+        // waits in `login.rs` and is sent after the handshake.
+        if self.supervisor.handshake_pending {
+            log(
+                WHO,
+                format_args!(
+                    "{} dropped: the greeter is still starting",
+                    reclogin::protocol::Framed::kind(message)
+                ),
+            );
+            return Next::Continue;
+        }
+        // Text too long for one packet (PAM's, the service's) is cut.
+        let fitted = greeter::fit_text(message);
+        let message = fitted.as_ref().unwrap_or(message);
         match self.greeter.send(message, &[]) {
             Ok(()) => Next::Continue,
+            // Could not be encoded: reclogind's own problem, never the
+            // greeter's, and not counted against it.
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                log(
+                    WHO,
+                    format_args!(
+                        "{} not sent (reclogind's fault, not the greeter's): {e}",
+                        reclogin::protocol::Framed::kind(message)
+                    ),
+                );
+                Next::Continue
+            }
             Err(e) => {
                 log(
                     WHO,
@@ -451,7 +513,13 @@ impl Daemon {
     fn poll_timeout(&self) -> libc::c_int {
         // Something timed in the login service's helper (a restart, a return
         // to check) shortens the wait.
-        match (self.greeter_timeout(), self.logind.wait_ms()) {
+        // A running session's desktop is looked at now and then
+        // (`login.rs`).
+        let other = match (self.logind.wait_ms(), self.login.wait_ms()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        match (self.greeter_timeout(), other) {
             (-1, Some(ms)) => ms,
             (base, Some(ms)) => base.min(ms),
             (base, None) => base,
@@ -477,6 +545,8 @@ impl Daemon {
 
     fn on_signal(&mut self, signal: i32) -> Next {
         match signal {
+            // Each is answered as the kernel requires; what follows is
+            // decided by which console is shown (`Daemon::console_changed`).
             console::RELEASE_SIGNAL => {
                 if self.shown {
                     self.release_display();
@@ -489,22 +559,6 @@ impl Daemon {
             console::ACQUIRE_SIGNAL => {
                 if let Err(e) = self.console.acknowledge_acquire() {
                     log(WHO, format_args!("taking the console back: {e}"));
-                }
-                // A session is starting or runs: its console comes back.
-                if let Some(next) = self.login_on_acquire() {
-                    return next;
-                }
-                if !self.shown {
-                    self.shown = true;
-                    self.logind_shown();
-                    if let Err(e) = self.display.take() {
-                        log(WHO, format_args!("taking the display back: {e}"));
-                    }
-                    if self.supervisor.handshake_pending {
-                        // Started while the console was not shown.
-                        return self.finish_handshake();
-                    }
-                    return self.send(&ToGreeter::Resume);
                 }
                 Next::Continue
             }
@@ -526,14 +580,28 @@ impl Daemon {
     }
 
     fn on_message(&mut self, message: ToDaemon) -> Next {
+        // While the login console is not shown the greeter is obeyed in
+        // nothing that acts (`greeter.rs`, `Daemon::refuse_while_paused`).
+        let message = if self.shown && self.console.is_shown() {
+            message
+        } else {
+            match self.refuse_while_paused(message) {
+                Ok(message) => message,
+                Err(next) => return next,
+            }
+        };
         match message {
             ToDaemon::Ready => {
                 log(WHO, "the greeter is ready");
+                self.greeter.mark_ready();
                 Next::Continue
             }
             ToDaemon::OpenDevice { request_id, path } => {
-                let opened = if self.shown {
-                    self.inputs.open(request_id, &path)
+                // Only to a greeter on the login console, asked of the
+                // kernel each time.
+                let opened = if self.shown && self.console.is_shown() {
+                    self.inputs
+                        .open(self.supervisor.generation, request_id, &path)
                 } else {
                     Err("the login console is not shown".to_string())
                 };
@@ -584,6 +652,7 @@ impl Daemon {
             // restarted; nothing is kept here (`keyboard.rs`).
             ToDaemon::SetLayout { .. } => Next::Continue,
             ToDaemon::ReturnTo { user } => self.on_return_to(user),
+            ToDaemon::EndGuest => self.on_end_guest(),
             ToDaemon::Power { action, confirmed } => self.on_power(action, confirmed),
         }
     }

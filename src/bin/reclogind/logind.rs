@@ -5,9 +5,11 @@
 //! process, `reclogind --login-service` ([`crate::loginhelper`]), because
 //! the D-Bus library starts threads and this process must stay
 //! single-threaded. The two talk over a socket pair with the crate's framing:
-//! the helper sends a [`View`] (the sessions on `seat0` of class `user`, and
-//! which power actions are allowed) whenever it changes, and answers
-//! requests (`activate`, `power`) with `done`.
+//! the helper sends a [`View`] (every session of class `user`, on any seat
+//! or over the network, and which power actions are allowed) whenever it
+//! changes, and answers requests (`activate`, `power`) with `done`. A
+//! request it does not answer within 15 seconds fails for the greeter, and
+//! the helper is ended and started again.
 //!
 //! - **While the helper is gone** (it died and waits out its back-off, or
 //!   was never started) the view is empty: no logged-in marks, no power
@@ -20,9 +22,16 @@
 //!   ([`Daemon::release_display`], the same steps as when the kernel asks
 //!   for the console). The console comes back the usual way (`SIGUSR2`),
 //!   and the paused greeter is resumed.
+//! - **Who counts where**: the logged-in marks of the list, returning, and
+//!   the foreground session use only sessions on `seat0` with a console
+//!   ([`View::local`]); the power question names everyone with a session.
 //! - **Power** ([`Daemon::on_power`]): refused unless the service allows
-//!   it; a restart or shut down while others are logged in is refused
-//!   unless `confirmed`, whatever the greeter says.
+//!   it. A restart or shut down while people are logged in is a question
+//!   reclogind asks (`power_question`, with who), and `confirmed` is
+//!   honoured only for the same action, within a minute of that question,
+//!   and only while nobody has logged in since; otherwise it asks again,
+//!   whatever the greeter says. An accepted restart or shut down that has
+//!   not happened 90 seconds later is given up, and the greeter is told.
 //! - **Not stealing the display**: see [`Service::start`] and
 //!   [`Daemon::view_changed`] (the foreground session).
 
@@ -33,7 +42,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use reclogin::log;
-use reclogin::protocol::{Framed, Power, PowerAction, ToGreeter};
+use reclogin::protocol::{Framed, LoggedIn, Power, PowerAction, ToGreeter};
 use reclogin::wire::Channel;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +66,12 @@ const BACK_OFF_MOST: Duration = Duration::from_secs(30);
 /// After a return was accepted: how long the login console may stay shown
 /// before the greeter takes the display back.
 const RETURN_WITHIN: Duration = Duration::from_secs(5);
+/// How long the helper has to answer a request.
+const ANSWER_WITHIN: Duration = Duration::from_secs(15);
+/// How long a `confirmed: true` may follow its question.
+const QUESTION_LASTS: Duration = Duration::from_secs(60);
+/// How long an accepted restart or shut down may take to happen.
+const GOING_DOWN_WITHIN: Duration = Duration::from_secs(90);
 
 const SERVICE_GONE: &str = "The login service is not available.";
 const TRY_AGAIN: &str = "Try again in a moment.";
@@ -64,7 +79,7 @@ const TRY_AGAIN: &str = "Try again in a moment.";
 // ---------------------------------------------------------------------------
 // the messages
 
-/// One running session of class `user` on `seat0`, as the helper read it.
+/// One running session of class `user`, as the helper read it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeatSession {
     pub id: String,
@@ -80,6 +95,20 @@ pub struct SeatSession {
     pub desktop: String,
     /// `Timestamp`, in seconds since the epoch, when the service gives it.
     pub since: Option<i64>,
+    /// The seat; empty for a session on none (one over the network).
+    #[serde(default)]
+    pub seat: String,
+    /// `Remote`: logged in over the network.
+    #[serde(default)]
+    pub remote: bool,
+}
+
+impl SeatSession {
+    /// On `seat0` with a console of its own: what the list marks and what
+    /// can be returned to.
+    pub fn is_local(&self) -> bool {
+        self.seat == "seat0" && self.console != 0
+    }
 }
 
 /// Everything asked of the login service, put together.
@@ -93,7 +122,29 @@ pub struct View {
 }
 
 impl View {
-    /// The user names with a running session, in the order of first start.
+    /// The sessions on `seat0` with a console ([`SeatSession::is_local`]).
+    pub fn local(&self) -> impl Iterator<Item = &SeatSession> {
+        self.sessions.iter().filter(|s| s.is_local())
+    }
+
+    /// Everyone with a running session, anywhere, in the order of first
+    /// start; remote when none of their sessions is local.
+    pub fn people(&self) -> Vec<LoggedIn> {
+        let mut people: Vec<LoggedIn> = Vec::new();
+        for session in &self.sessions {
+            match people.iter_mut().find(|p| p.user == session.user) {
+                Some(person) => person.remote &= session.remote,
+                None => people.push(LoggedIn {
+                    user: session.user.clone(),
+                    remote: session.remote,
+                }),
+            }
+        }
+        people
+    }
+
+    /// The user names with a running session (anywhere), in the order of
+    /// first start.
     pub fn users(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         for session in &self.sessions {
@@ -104,10 +155,9 @@ impl View {
         names
     }
 
-    /// The newest session of `user` (the one started last).
+    /// The newest local session of `user` (the one started last).
     fn newest_of(&self, user: &str) -> Option<&SeatSession> {
-        self.sessions
-            .iter()
+        self.local()
             .filter(|s| s.user == user)
             .max_by_key(|s| s.since.unwrap_or(0))
     }
@@ -189,6 +239,14 @@ enum Pending {
     Power { request: u64, action: PowerAction },
 }
 
+/// The power question reclogind sent: for which action, when, and who was
+/// logged in then.
+struct Asked {
+    action: PowerAction,
+    at: Instant,
+    users: Vec<String>,
+}
+
 /// What came from the helper.
 enum Received {
     Nothing,
@@ -210,6 +268,10 @@ pub struct Service {
     back_off: Duration,
     next_request: u64,
     pending: Option<Pending>,
+    /// When `pending` was sent.
+    pending_since: Option<Instant>,
+    /// The last power question sent to the greeter.
+    asked: Option<Asked>,
     /// The console of a user session that is the one shown while the login
     /// console is not: one returned to, or the one that was shown when
     /// reclogind started. When that session ends and nothing else is shown,
@@ -218,8 +280,9 @@ pub struct Service {
     /// After a return was accepted: when to check that the login console is
     /// no longer the one shown.
     returning: Option<Instant>,
-    /// A restart or shut down went through: nothing more is asked.
-    going_down: bool,
+    /// A restart or shut down went through, at this moment: nothing more
+    /// is asked until it happens or [`GOING_DOWN_WITHIN`] has passed.
+    going_down: Option<(PowerAction, Instant)>,
 }
 
 impl Service {
@@ -231,9 +294,11 @@ impl Service {
             back_off: BACK_OFF_LEAST,
             next_request: 0,
             pending: None,
+            pending_since: None,
+            asked: None,
             foreground: None,
             returning: None,
-            going_down: false,
+            going_down: None,
         }
     }
 
@@ -249,9 +314,10 @@ impl Service {
         service
     }
 
-    /// Whether `console` is the console of a running user session.
+    /// Whether `console` is the console of a running user session on
+    /// `seat0`.
     pub fn session_on(&self, console: u32) -> bool {
-        console != 0 && self.view.sessions.iter().any(|s| s.console == console)
+        console != 0 && self.view.local().any(|s| s.console == console)
     }
 
     fn spawn(&mut self) {
@@ -311,7 +377,12 @@ impl Service {
         if self.helper.is_none() {
             at = self.restart_at;
         }
-        if let Some(t) = self.returning {
+        let timers = [
+            self.returning,
+            self.pending_since.map(|t| t + ANSWER_WITHIN),
+            self.going_down.map(|(_, t)| t + GOING_DOWN_WITHIN),
+        ];
+        for t in timers.into_iter().flatten() {
             at = Some(at.map_or(t, |a| a.min(t)));
         }
         at.map(|t| {
@@ -496,6 +567,45 @@ impl Daemon {
             }
         }
         let now = Instant::now();
+        if self
+            .logind
+            .pending_since
+            .is_some_and(|t| now.duration_since(t) >= ANSWER_WITHIN)
+        {
+            log(
+                WHO,
+                "the login-service helper did not answer within 15 seconds; starting it again",
+            );
+            self.logind.pending_since = None;
+            if let Some(pending) = self.logind.pending.take() {
+                if let Next::Stop =
+                    self.request_failed(pending, "The login service did not answer.")
+                {
+                    return Next::Stop;
+                }
+            }
+            if let Next::Stop = self.logind_lost() {
+                return Next::Stop;
+            }
+        }
+        if let Some((action, since)) = self.logind.going_down {
+            if now.duration_since(since) >= GOING_DOWN_WITHIN {
+                self.logind.going_down = None;
+                log(
+                    WHO,
+                    format_args!(
+                        "the system did not {} within {} seconds; power actions are offered again",
+                        verb(action),
+                        GOING_DOWN_WITHIN.as_secs()
+                    ),
+                );
+                if let Next::Stop = self.send(&ToGreeter::PowerRefused {
+                    text: format!("The system did not {}.", verb(action)),
+                }) {
+                    return Next::Stop;
+                }
+            }
+        }
         if self.logind.helper.is_none() && self.logind.restart_at.is_some_and(|t| now >= t) {
             self.logind.spawn();
         }
@@ -531,6 +641,7 @@ impl Daemon {
     /// a request waiting for it fails.
     fn logind_lost(&mut self) -> Next {
         let changed = self.logind.lost();
+        self.logind.pending_since = None;
         if let Some(pending) = self.logind.pending.take() {
             if let Next::Stop = self.request_failed(pending, SERVICE_GONE) {
                 return Next::Stop;
@@ -562,7 +673,7 @@ impl Daemon {
         // console (a text login, say) is left where they are.
         if let Some(shown) = self.logind.foreground {
             let view = &self.logind.view;
-            if view.available && !view.sessions.iter().any(|s| s.console == shown) {
+            if view.available && !view.local().any(|s| s.console == shown) {
                 self.logind.foreground = None;
                 if !self.shown
                     && !self.login.greeter_away()
@@ -594,16 +705,13 @@ impl Daemon {
         let _ = self.send(&ToGreeter::Pause);
     }
 
-    /// The display taken back and the paused greeter resumed.
+    /// The display taken back and the paused greeter resumed, when the
+    /// login console is the one shown (`console.rs`).
     fn retake_display(&mut self) -> Next {
-        if self.shown {
+        if self.shown || !self.console.is_shown() || self.login.greeter_away() {
             return Next::Continue;
         }
-        self.shown = true;
-        if let Err(e) = self.display.take() {
-            log(WHO, format_args!("taking the display back: {e}"));
-        }
-        self.send(&ToGreeter::Resume)
+        self.show_greeter()
     }
 
     /// `return_to { user }`: bring the user's session to the front.
@@ -623,6 +731,7 @@ impl Daemon {
         if self.logind.pending.is_some() {
             return refuse(self, TRY_AGAIN);
         }
+        // Return is about local sessions only (`View::local`).
         let Some(session) = self.logind.view.newest_of(&user).cloned() else {
             // It ended since the screen was drawn: the next state says so.
             return refuse(self, "That session is not running any more.");
@@ -636,6 +745,7 @@ impl Daemon {
             request,
             console: session.console,
         });
+        self.logind.pending_since = Some(Instant::now());
         let sent = self.logind.send(&ToHelper::Activate {
             request,
             id: session.id,
@@ -653,7 +763,7 @@ impl Daemon {
         let refuse = |this: &mut Daemon, text: &str| {
             this.send(&ToGreeter::PowerRefused { text: text.into() })
         };
-        if self.logind.going_down {
+        if self.logind.going_down.is_some() {
             return Next::Continue;
         }
         if !self.logind.view.available {
@@ -662,23 +772,44 @@ impl Daemon {
         if !self.logind.view.allows(action) {
             return refuse(self, "The system does not allow that now.");
         }
-        // Restart and shut down end other people's sessions: only after the
-        // question, whatever the greeter says. Sleep keeps them.
-        if matches!(action, PowerAction::Restart | PowerAction::ShutDown)
-            && !confirmed
-            && !self.logind.view.users().is_empty()
-        {
-            return refuse(
-                self,
-                "Other people are logged in. Choose it again to see who.",
-            );
+        // Restart and shut down end other people's sessions: only after
+        // reclogind's own question, whatever the greeter says. Sleep keeps
+        // them.
+        if matches!(action, PowerAction::Restart | PowerAction::ShutDown) {
+            let users = self.logind.view.users();
+            let answered = confirmed
+                && self.logind.asked.as_ref().is_some_and(|asked| {
+                    asked.action == action
+                        && asked.at.elapsed() < QUESTION_LASTS
+                        && users.iter().all(|u| asked.users.contains(u))
+                });
+            if !users.is_empty() && !answered {
+                if confirmed {
+                    log(
+                        WHO,
+                        format_args!(
+                            "a confirmed {} without a current question; asking again",
+                            verb(action)
+                        ),
+                    );
+                }
+                self.logind.asked = Some(Asked {
+                    action,
+                    at: Instant::now(),
+                    users,
+                });
+                let people = self.logind.view.people();
+                return self.send(&ToGreeter::PowerQuestion { action, people });
+            }
         }
         if self.logind.pending.is_some() {
             return refuse(self, TRY_AGAIN);
         }
+        self.logind.asked = None;
         self.logind.next_request += 1;
         let request = self.logind.next_request;
         self.logind.pending = Some(Pending::Power { request, action });
+        self.logind.pending_since = Some(Instant::now());
         log(
             WHO,
             format_args!("asking the login service to {}", verb(action)),
@@ -702,6 +833,7 @@ impl Daemon {
             return Next::Continue;
         }
         let pending = self.logind.pending.take().expect("checked above");
+        self.logind.pending_since = None;
         if !ok {
             let reason = if text.is_empty() {
                 "No reason was given.".to_string()
@@ -732,7 +864,7 @@ impl Daemon {
             Pending::Power { action, .. } => {
                 log(WHO, format_args!("the login service will {}", verb(action)));
                 if action != PowerAction::Sleep {
-                    self.logind.going_down = true;
+                    self.logind.going_down = Some((action, Instant::now()));
                 }
                 Next::Continue
             }

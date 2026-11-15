@@ -77,9 +77,25 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The descriptor the server writes its display number to.
 const DISPLAY_FD: i32 = 3;
+/// The display number's line is short; more without a newline is not one.
+const DISPLAY_LINE_MAX: usize = 32;
+
+/// The server's output (which the user can write to as well) reaches the
+/// log in lines of at most this many bytes (longer ones are cut) ...
+const LINE_CAP: usize = 1024;
+/// ... at most this many lines a second, and one line saying how many more
+/// were dropped ...
+const LINES_PER_SECOND: u32 = 50;
+/// ... and one call of `drain` reads at most this much, so that a writer
+/// that never stops cannot keep the worker in it.
+const DRAIN_MAX: usize = 64 * 1024;
 
 /// libXau's `FamilyLocal`.
 const FAMILY_LOCAL: u16 = 256;
+/// libXau's `FamilyWild`: matches any host. Written beside the local entry,
+/// with an empty address, so that clients still find the cookie when the
+/// host name changes during the session (as display managers do).
+const FAMILY_WILD: u16 = 65535;
 const COOKIE_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
 const COOKIE_LEN: usize = 16;
 
@@ -177,7 +193,8 @@ fn host_name() -> io::Result<Vec<u8>> {
     Ok(buf[..len].to_vec())
 }
 
-/// The X authority file: one entry, written by the worker as the user.
+/// The X authority file: two entries (this host, any host), written by the
+/// worker as the user.
 struct AuthFile {
     path: PathBuf,
     file: File,
@@ -239,22 +256,21 @@ impl AuthFile {
         Err(last)
     }
 
-    /// Write the file's one entry for display `number` (empty before the
-    /// server has said which one; the server ignores the number). libXau's
+    /// Write the file's entries for display `number` (empty before the
+    /// server has said which one; the server ignores the number): one for
+    /// this host (`FamilyLocal` and the host name), one for any host
+    /// (`FamilyWild`, empty address), the same cookie in both. libXau's
     /// format (`XauWriteAuth`): the family as a big-endian 16-bit number,
     /// then address, number, name and data, each as a big-endian 16-bit
     /// length and that many bytes.
     fn write(&self, number: &str) -> io::Result<()> {
-        let mut entry = Vec::with_capacity(64 + self.host.len());
-        entry.extend_from_slice(&FAMILY_LOCAL.to_be_bytes());
-        for field in [
-            &self.host[..],
-            number.as_bytes(),
-            COOKIE_NAME,
-            &self.cookie[..],
-        ] {
-            entry.extend_from_slice(&(field.len() as u16).to_be_bytes());
-            entry.extend_from_slice(field);
+        let mut entry = Vec::with_capacity(128 + self.host.len());
+        for (family, address) in [(FAMILY_LOCAL, &self.host[..]), (FAMILY_WILD, &[][..])] {
+            entry.extend_from_slice(&family.to_be_bytes());
+            for field in [address, number.as_bytes(), COOKIE_NAME, &self.cookie[..]] {
+                entry.extend_from_slice(&(field.len() as u16).to_be_bytes());
+                entry.extend_from_slice(field);
+            }
         }
         let written = self
             .file
@@ -294,8 +310,12 @@ pub struct XServer {
     /// The read end of the server's standard output and error; `None` once
     /// it closed.
     output: Option<OwnedFd>,
-    /// An unfinished line of the server's output.
-    partial: Vec<u8>,
+    /// Its lines on their way to the log, bounded.
+    lines: LineLog,
+    /// A process descriptor of the server, for `reclogind` (which may
+    /// signal the server's process group only while it lives); `None` when
+    /// the kernel has none (`pidfd_open`, Linux 5.3).
+    pidfd: Option<OwnedFd>,
     /// The wait status, once reaped.
     status: Option<i32>,
     /// The console device (the session's [`session`] `Tty` owns it and
@@ -321,6 +341,12 @@ impl XServer {
         &self.auth.path
     }
 
+    /// The server's process descriptor, sent to `reclogind` with
+    /// `ready_to_start`.
+    pub fn pidfd(&self) -> Option<&OwnedFd> {
+        self.pidfd.as_ref()
+    }
+
     /// Reap the server if it has ended.
     fn reap(&mut self) -> Option<i32> {
         if self.status.is_none() {
@@ -335,33 +361,32 @@ impl XServer {
         self.status
     }
 
-    /// Pass what the server wrote to the system log, a line at a time.
+    /// Pass what the server wrote to the system log, a line at a time:
+    /// at most [`DRAIN_MAX`] bytes a call (the rest waits for the next
+    /// call), lines cut at [`LINE_CAP`], at most [`LINES_PER_SECOND`].
     fn drain(&mut self) {
         let Some(fd) = &self.output else {
             return;
         };
         let mut buf = [0u8; 4096];
-        let closed = loop {
+        let mut taken = 0;
+        let mut closed = false;
+        while taken < DRAIN_MAX {
             let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
-                self.partial.extend_from_slice(&buf[..n as usize]);
+                self.lines.push(&buf[..n as usize]);
+                taken += n as usize;
                 continue;
             }
             if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             // 0: the server closed it; an error (EAGAIN): nothing more now.
-            break n == 0;
-        };
-        while let Some(end) = self.partial.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.partial.drain(..=end).collect();
-            log_line(&line[..line.len() - 1]);
-        }
-        if (closed || self.partial.len() > 4096) && !self.partial.is_empty() {
-            let rest = std::mem::take(&mut self.partial);
-            log_line(&rest);
+            closed = n == 0;
+            break;
         }
         if closed {
+            self.lines.finish();
             self.output = None;
         }
     }
@@ -481,11 +506,92 @@ impl Drop for XServer {
     }
 }
 
-fn log_line(line: &[u8]) {
-    log(
-        WHO,
-        format_args!("X server: {}", String::from_utf8_lossy(line)),
-    );
+/// The server's output on its way to the log, in constant memory: one
+/// unfinished line of at most [`LINE_CAP`] bytes (a longer line is logged
+/// cut, and the rest of it up to its newline is dropped), and at most
+/// [`LINES_PER_SECOND`] lines a second; what is dropped beyond that is
+/// counted and said in one line when the next second begins.
+struct LineLog {
+    partial: Vec<u8>,
+    /// The rest of a cut line is being skipped, up to its newline.
+    skipping: bool,
+    window: Instant,
+    in_window: u32,
+    dropped: u64,
+}
+
+impl LineLog {
+    fn new() -> LineLog {
+        LineLog {
+            partial: Vec::with_capacity(LINE_CAP),
+            skipping: false,
+            window: Instant::now(),
+            in_window: 0,
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b == b'\n' {
+                if !self.skipping {
+                    self.emit(false);
+                }
+                self.skipping = false;
+                self.partial.clear();
+            } else if !self.skipping {
+                self.partial.push(b);
+                if self.partial.len() >= LINE_CAP {
+                    // The cap is reached: what there is goes out, cut.
+                    self.emit(true);
+                    self.skipping = true;
+                }
+            }
+        }
+    }
+
+    /// The server closed its output: an unfinished line is logged.
+    fn finish(&mut self) {
+        if !self.skipping && !self.partial.is_empty() {
+            self.emit(false);
+        }
+        self.partial.clear();
+        self.skipping = false;
+        self.say_dropped();
+    }
+
+    fn emit(&mut self, cut: bool) {
+        let now = Instant::now();
+        if now.duration_since(self.window) >= Duration::from_secs(1) {
+            self.say_dropped();
+            self.window = now;
+            self.in_window = 0;
+        }
+        if self.in_window >= LINES_PER_SECOND {
+            self.dropped += 1;
+        } else {
+            self.in_window += 1;
+            log(
+                WHO,
+                format_args!(
+                    "X server: {}{}",
+                    String::from_utf8_lossy(&self.partial),
+                    if cut { " [cut]" } else { "" }
+                ),
+            );
+        }
+        self.partial.clear();
+    }
+
+    fn say_dropped(&mut self) {
+        if self.dropped > 0 {
+            log(
+                WHO,
+                format_args!("X server: {} more lines dropped", self.dropped),
+            );
+            self.dropped = 0;
+        }
+    }
 }
 
 fn pollfd(fd: RawFd) -> libc::pollfd {
@@ -653,6 +759,9 @@ pub fn start(
     envp.push(std::ptr::null());
     let (uid, gid) = (account.uid, account.gid);
     let before = active_console();
+    // A guest's server, and everything it starts, makes no set-id file
+    // (`nosetid.rs`). Made before the fork: it allocates.
+    let filter = (uid == crate::guest::UID).then(crate::nosetid::Filter::new);
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -696,19 +805,27 @@ pub fn start(
             if libc::chdir(home.as_ptr()) != 0 {
                 libc::chdir(c"/".as_ptr());
             }
+            if let Some(filter) = &filter {
+                if filter.install().is_err() {
+                    libc::_exit(126);
+                }
+            }
             libc::execve(argv[0].as_ptr(), argv_p.as_ptr(), envp.as_ptr());
             libc::_exit(127);
         }
     }
     drop(ready_w);
     drop(out_w);
+    // Our child, not reaped: the number is still this process.
+    let pidfd = session::pidfd_open(pid);
 
     let mut server = XServer {
         pid,
         display: String::new(),
         auth,
         output: Some(out_r),
-        partial: Vec::new(),
+        lines: LineLog::new(),
+        pidfd,
         status: None,
         tty,
         stopped: false,
@@ -818,6 +935,13 @@ fn wait_until_ready(
             let got = unsafe { libc::read(ready.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if got > 0 {
                 said.extend_from_slice(&buf[..got as usize]);
+                if said.len() > DISPLAY_LINE_MAX && !said.contains(&b'\n') {
+                    log(
+                        WHO,
+                        "the X server wrote more than a display number without a newline",
+                    );
+                    return Err(StartError::Failed(NOT_STARTED));
+                }
             } else if got == 0 {
                 // Closed without a number: the server is ending (or never
                 // ran); its end is reaped above.

@@ -17,10 +17,12 @@ mod form;
 mod input;
 mod kms;
 mod link;
+mod osk;
 mod paint;
 mod sample;
 mod sandbox;
 mod screens;
+mod watch;
 
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
@@ -34,7 +36,7 @@ use chrono::{Local, Timelike};
 use reclogin::brand::Brand;
 use reclogin::log;
 use reclogin::protocol::{
-    MessageKind, PromptKind, Secret, State, ToDaemon, ToGreeter, Who, VERSION,
+    MessageKind, PromptKind, Secret, State, ToDaemon, ToGreeter, Who, GREETER_EXIT_NO_MODE, VERSION,
 };
 use tiny_skia::Pixmap;
 
@@ -49,13 +51,14 @@ const WHO: &str = "reclogin-greeter";
 
 const USAGE: &str = "usage: reclogin-greeter [--no-sandbox]
        reclogin-greeter --render-png FILE --brand-dir DIR [--size WxH] [--state FILE.json]
-                        [--at 'YYYY-MM-DD HH:MM'] [--typed N]
+                        [--at 'YYYY-MM-DD HH:MM'] [--typed N] [--second-screen]
 
 Without arguments it is started by reclogind, which passes its socket and
 has locked it down; --no-sandbox (passed by `reclogind --no-sandbox`) lets it
 run without that lock-down. --render-png draws one frame of the login screen to FILE and exits; it opens
 no device and no socket. --size defaults to 1920x1080, --state to a built-in
-sample, --at to now, --typed (characters in the password field) to 12.";
+sample, --at to now, --typed (characters in the password field) to 12.
+--second-screen draws what the other monitors show instead of the login.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -72,14 +75,32 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log(WHO, format_args!("{e:#}"));
+            // reclogind names this one in its log (and counts it).
+            if e.downcast_ref::<NoMode>().is_some() {
+                return ExitCode::from(GREETER_EXIT_NO_MODE);
+            }
             ExitCode::FAILURE
         }
     }
 }
 
+/// The display took no mode (or showed no first frame): the exit status
+/// says so (`GREETER_EXIT_NO_MODE`).
+#[derive(Debug)]
+struct NoMode;
+
+impl std::fmt::Display for NoMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the display could not be set up")
+    }
+}
+
+impl std::error::Error for NoMode {}
+
 fn render_options(args: &[String]) -> Result<Option<sample::Options>> {
     let (mut png, mut brand_dir, mut size, mut state, mut at, mut typed) =
         (None, None, (1920, 1080), None, None, 12);
+    let mut second = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = || {
@@ -93,6 +114,7 @@ fn render_options(args: &[String]) -> Result<Option<sample::Options>> {
             "--size" => size = sample::parse_size(&value()?)?,
             "--state" => state = Some(PathBuf::from(value()?)),
             "--at" => at = Some(value()?),
+            "--second-screen" => second = true,
             "--typed" => {
                 typed = value()?
                     .parse::<usize>()
@@ -119,11 +141,15 @@ fn render_options(args: &[String]) -> Result<Option<sample::Options>> {
         state,
         at,
         typed,
+        second,
     }))
 }
 
 /// The first three messages: who we talk to, the display, the state.
-fn start(link: &mut Link) -> Result<(PathBuf, OwnedFd, State)> {
+/// reclogind sends nothing else in between; anything else that comes (from
+/// an older reclogind, say) is passed over rather than taken as an error,
+/// and `quit` ends the greeter quietly (`None`).
+fn start(link: &mut Link) -> Result<Option<(PathBuf, OwnedFd, State)>> {
     let brand_dir = match link.next()? {
         (ToGreeter::Hello { version, brand_dir }, _) if version == VERSION => brand_dir,
         (ToGreeter::Hello { version, .. }, _) => {
@@ -134,26 +160,35 @@ fn start(link: &mut Link) -> Result<(PathBuf, OwnedFd, State)> {
             reclogin::protocol::Framed::kind(&other)
         ),
     };
-    let display = match link.next()? {
-        (ToGreeter::Display { path }, mut handles) => {
-            log(WHO, format_args!("display {path}"));
-            handles
-                .pop()
-                .context("the display came without its handle")?
+    let passed_over = |other: &ToGreeter, waiting: &str| {
+        log(
+            WHO,
+            format_args!(
+                "{} before the {waiting} passed over",
+                reclogin::protocol::Framed::kind(other)
+            ),
+        );
+    };
+    let display = loop {
+        match link.next()? {
+            (ToGreeter::Display { path }, mut handles) => {
+                log(WHO, format_args!("display {path}"));
+                break handles
+                    .pop()
+                    .context("the display came without its handle")?;
+            }
+            (ToGreeter::Quit, _) => return Ok(None),
+            (other, _) => passed_over(&other, "display"),
         }
-        (other, _) => bail!(
-            "expected display, got {}",
-            reclogin::protocol::Framed::kind(&other)
-        ),
     };
-    let state = match link.next()? {
-        (ToGreeter::State(state), _) => *state,
-        (other, _) => bail!(
-            "expected state, got {}",
-            reclogin::protocol::Framed::kind(&other)
-        ),
+    let state = loop {
+        match link.next()? {
+            (ToGreeter::State(state), _) => break *state,
+            (ToGreeter::Quit, _) => return Ok(None),
+            (other, _) => passed_over(&other, "state"),
+        }
     };
-    Ok((brand_dir, display, state))
+    Ok(Some((brand_dir, display, state)))
 }
 
 struct Greeter {
@@ -172,6 +207,7 @@ struct Greeter {
     /// Pointer drawn into the frame because there is no hardware cursor.
     soft_pointer: Option<(f32, f32)>,
     minute: u32,
+    watch: watch::Watch,
 }
 
 enum Next {
@@ -189,10 +225,12 @@ fn run(locked: bool) -> Result<()> {
     if locked {
         sandbox::no_new_sockets()?;
     }
-    let (brand_dir, display, state) = start(&mut link.borrow_mut())?;
+    let Some((brand_dir, display, state)) = start(&mut link.borrow_mut())? else {
+        return Ok(());
+    };
     let brand = Brand::load(&brand_dir)?;
     let look = Look::load(brand)?;
-    let screen = Screen::new(display)?;
+    let screen = Screen::new(display).map_err(|e| e.context(NoMode))?;
     let (w, h) = screen.size();
     let layout = state
         .layouts
@@ -216,8 +254,11 @@ fn run(locked: bool) -> Result<()> {
         dirty: true,
         soft_pointer: None,
         minute: Local::now().minute(),
+        watch: watch::Watch::new(),
     };
-    greeter.draw()?;
+    // The first frame sets the mode; `ready` (from which reclogind counts
+    // pings) follows it.
+    greeter.draw().map_err(|e| e.context(NoMode))?;
     greeter.link.borrow().send(&ToDaemon::Ready)?;
     greeter.serve()
 }
@@ -235,12 +276,12 @@ impl Greeter {
                     return Ok(());
                 }
             }
-            if self.dirty && !self.paused && self.screen.ready() {
+            if self.dirty && !self.paused && !self.watch.asleep && self.screen.ready() {
                 self.draw()?;
             }
 
             let now = Instant::now();
-            let mut due = next_minute();
+            let mut due = next_minute().min(self.watch_due());
             if let Some(repeat) = self.input.repeat_due() {
                 due = due.min(repeat);
             }
@@ -291,6 +332,7 @@ impl Greeter {
             if let Some(happening) = self.input.repeat_now(Instant::now()) {
                 self.on_happening(happening);
             }
+            self.tick();
             let minute = Local::now().minute();
             if minute != self.minute {
                 self.minute = minute;
@@ -300,6 +342,7 @@ impl Greeter {
     }
 
     fn draw(&mut self) -> Result<()> {
+        self.sync_keyboard();
         let clock = Clock::at(Local::now(), self.state.clock_24h);
         let mut painter = self.look.begin(&mut self.frame);
         screens::draw(
@@ -315,7 +358,9 @@ impl Greeter {
             kms::draw_arrow(&mut self.frame, x, y);
         }
         self.screen.present(&self.frame)?;
+        self.draw_others();
         self.dirty = false;
+        self.after_draw();
         Ok(())
     }
 
@@ -379,6 +424,14 @@ impl Greeter {
             ToGreeter::PowerRefused { text } => {
                 self.form.notice = Some((MessageKind::Error, text));
             }
+            // reclogind's question before a restart or shut down while
+            // people are logged in: its list, not the greeter's own idea.
+            ToGreeter::PowerQuestion { action, people } => {
+                if self.paused {
+                    return Next::Continue;
+                }
+                self.form.ask_power(action, people, &self.state);
+            }
             ToGreeter::AuthResult { ok, text } => {
                 self.pending = None;
                 // The answer to a cancel (or the attempt's own end, which
@@ -416,10 +469,12 @@ impl Greeter {
                 self.form.close_question(&self.state);
                 self.input.suspend();
                 self.screen.pause();
+                self.watch.paused();
                 return Next::Continue;
             }
             ToGreeter::Resume => {
                 self.paused = false;
+                self.watch.resumed();
                 self.input.resume();
             }
             ToGreeter::Quit => return Next::Quit,
@@ -439,6 +494,10 @@ impl Greeter {
     }
 
     fn on_happening(&mut self, happening: Happening) {
+        let Some(happening) = self.admit(happening) else {
+            self.dirty = true;
+            return;
+        };
         match happening {
             Happening::Key(key) => {
                 if let Some(action) = self.form.key(key, &self.state) {
@@ -454,6 +513,7 @@ impl Greeter {
                 self.soft_pointer = Some((x, y));
             }
             Happening::Press(x, y) => {
+                let touched = self.take_touch_down();
                 // The last one drawn is on top (the session menu).
                 let target = self
                     .hits
@@ -463,8 +523,11 @@ impl Greeter {
                     .map(|(_, t)| *t);
                 if let Some(target) = target {
                     self.press(target);
+                    self.after_press(target, touched);
                 }
             }
+            // Handled (and turned into presses) by `admit`.
+            Happening::Release | Happening::Touch(..) => {}
         }
         self.dirty = true;
     }
@@ -534,10 +597,24 @@ impl Greeter {
                     self.act(action);
                 }
             }
+            Target::EndGuest => self.end_guest(),
             Target::SessionOption(_) | Target::Menu | Target::Confirm => {}
-            // The on-screen keyboard is a later stage.
-            Target::OnScreenKeyboard => {}
+            Target::OnScreenKeyboard => osk::open(&mut self.form, &self.state),
+            Target::Key(id) => self.press_key(id),
         }
+    }
+
+    /// "End the guest session": reclogind answers with `auth_result`, `ok`
+    /// when the session was asked to end (the screen then follows the next
+    /// state, which no longer has the guest running), else why not.
+    fn end_guest(&mut self) {
+        if self.form.busy || !form::guest_running(&self.state) {
+            return;
+        }
+        self.form.notice = None;
+        self.form.busy = true;
+        self.form.returning = true;
+        self.send(&ToDaemon::EndGuest);
     }
 
     /// A click while the power question is shown: "… anyway", "Cancel", a

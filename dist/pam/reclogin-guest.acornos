@@ -9,13 +9,20 @@
 # pam_open_session that the login service registered it (XDG_SESSION_ID)
 # and refuses the guest otherwise. pam_limits reads
 # /etc/security/limits.d/50-reclogin-guest.conf (nproc for the uid sweep).
+# pam_nologin: /etc/nologin (or /run/nologin) keeps the guest out like
+# everyone else. pam_keyinit force revoke: the guest's session gets a session
+# keyring of its own (none of reclogind's is inherited) and it is revoked
+# when the session closes; the guest's user keyrings are cleared by the
+# cleanup's sweep.
 # Expected in Alpine's linux-pam package: pam_succeed_if, pam_permit,
 # pam_deny, pam_limits, pam_unix (not checked against its file list).
 auth      requisite  pam_succeed_if.so quiet user = guest
 auth      required   pam_permit.so
 account   requisite  pam_succeed_if.so quiet user = guest
+account   required   pam_nologin.so
 account   required   pam_permit.so
 password  required   pam_deny.so
+-session  optional   pam_keyinit.so force revoke
 session   required   pam_limits.so
 session   required   pam_unix.so
 -session  optional   pam_systemd.so

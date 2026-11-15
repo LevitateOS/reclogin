@@ -5,7 +5,7 @@
 //! everyone, the logged-in ones lit. Positions and sizes are the design's,
 //! in 1920×1080 units.
 
-use reclogin::protocol::{MessageKind, PowerAction, State};
+use reclogin::protocol::{MessageKind, PowerAction};
 
 use super::login::{
     footer, header, header_height, message_look, notice_line, View, FOOTER_H, FORM_W, FORM_X,
@@ -46,7 +46,7 @@ pub fn draw(p: &mut Painter, v: &View, action: PowerAction) {
         false,
     );
 
-    let who = format!("{} still logged in.", who_text(v.state));
+    let who = format!("{} still logged in.", who_text(v));
     let cost = format!("{noun} closes their desktops. Work they have not saved is lost.");
     let lines: Vec<_> = [(who, pal.text), (cost, pal.text_secondary)]
         .into_iter()
@@ -143,19 +143,26 @@ pub fn draw(p: &mut Painter, v: &View, action: PowerAction) {
     footer(p, v);
 }
 
-/// "Kai Moreno and Noor Haddad are": the people with a session, by the
-/// name shown in the list (the account name for one that is not listed),
-/// and the verb.
-fn who_text(state: &State) -> String {
-    let names: Vec<String> = state
-        .others_logged_in
+/// "Kai Moreno and Noor Haddad are": the people reclogind named in its
+/// question, by the name shown in the list (the account name for one that is
+/// not listed), "(remote)" after one logged in over the network, and the verb.
+fn who_text(v: &View) -> String {
+    let names: Vec<String> = v
+        .form
+        .question_people
         .iter()
-        .map(|account| {
-            state
+        .map(|person| {
+            let name = v
+                .state
                 .users
                 .iter()
-                .find(|u| &u.name == account)
-                .map_or_else(|| account.clone(), |u| u.real_name.clone())
+                .find(|u| u.name == person.user)
+                .map_or_else(|| person.user.clone(), |u| u.real_name.clone());
+            if person.remote {
+                format!("{name} (remote)")
+            } else {
+                name
+            }
         })
         .collect();
     match names.as_slice() {

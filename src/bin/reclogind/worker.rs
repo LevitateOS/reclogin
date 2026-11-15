@@ -78,7 +78,24 @@ pub enum ToWorker {
     },
     /// First message of a guest login instead of `start` (`guest.rs`): the
     /// account `guest`, PAM's `reclogin-guest` service, no conversation.
-    StartGuest { session: SessionRef, console: u32 },
+    /// `wait`: a cleanup that runs now is waited for (the automatic login
+    /// at start, which comes while the start's cleanup runs); otherwise
+    /// the login is refused with "still being cleared".
+    StartGuest {
+        session: SessionRef,
+        console: u32,
+        #[serde(default)]
+        wait: bool,
+    },
+    /// First message of the automatic login instead of `start`
+    /// (`autologin.rs`): PAM's `reclogin-autologin` service, no
+    /// conversation. Sent only by reclogind's start-up, for the account
+    /// named in `/etc/reclogin.conf`.
+    StartAuto {
+        user: String,
+        session: SessionRef,
+        console: u32,
+    },
     /// The answer to the last `Prompt`: the next packet is the secret, raw.
     Answer,
     /// Abandon the login; or, once the session runs, end it.
@@ -94,6 +111,12 @@ pub enum Command {
         console: u32,
     },
     StartGuest {
+        session: SessionRef,
+        console: u32,
+        wait: bool,
+    },
+    StartAuto {
+        user: String,
         session: SessionRef,
         console: u32,
     },
@@ -118,9 +141,30 @@ pub fn receive(channel: &Channel) -> io::Result<Option<Command>> {
             session,
             console,
         }),
-        Some((ToWorker::StartGuest { session, console }, _)) => {
-            Some(Command::StartGuest { session, console })
-        }
+        Some((
+            ToWorker::StartGuest {
+                session,
+                console,
+                wait,
+            },
+            _,
+        )) => Some(Command::StartGuest {
+            session,
+            console,
+            wait,
+        }),
+        Some((
+            ToWorker::StartAuto {
+                user,
+                session,
+                console,
+            },
+            _,
+        )) => Some(Command::StartAuto {
+            user,
+            session,
+            console,
+        }),
         Some((ToWorker::Answer, _)) => channel.recv_secret()?.map(Command::Answer),
         Some((ToWorker::Cancel, _)) => Some(Command::Cancel),
     })
@@ -131,6 +175,7 @@ impl Command {
         match self {
             Command::Start { .. } => "start",
             Command::StartGuest { .. } => "start_guest",
+            Command::StartAuto { .. } => "start_auto",
             Command::Answer(_) => "answer",
             Command::Cancel => "cancel",
         }
@@ -152,11 +197,29 @@ pub enum FromWorker {
     Accepted,
     /// The PAM session is open on `console`: show that console. The worker
     /// starts the desktop once the console is shown. `x_server`: the X
-    /// server's process (and process group), for an X session.
-    ReadyToStart { console: u32, x_server: Option<i32> },
+    /// server's process (and process group), for an X session; `x_pidfd`:
+    /// its process descriptor comes with the message as a handle.
+    ReadyToStart {
+        console: u32,
+        x_server: Option<i32>,
+        #[serde(default)]
+        x_pidfd: bool,
+    },
     /// The desktop's process runs on `console`; `desktop` is its process id
-    /// and process group. From here the worker no longer needs `reclogind`.
-    Started { console: u32, desktop: i32 },
+    /// and process group; `pidfd`: its process descriptor comes with the
+    /// message as a handle. From here the worker no longer needs
+    /// `reclogind`.
+    Started {
+        console: u32,
+        desktop: i32,
+        #[serde(default)]
+        pidfd: bool,
+    },
+    /// The worker enters (`on`) or leaves a step that must not be cut short:
+    /// the guest's cleanup and the mount of its home, opening or closing the
+    /// PAM session. `reclogind` does not kill a worker it asked to end while
+    /// it is in one, for up to two minutes (`login.rs`).
+    Hold { on: bool },
     /// The session is over and closed. `status` is the desktop process's
     /// wait status, or -1 when it never ran.
     Ended { status: i32 },
@@ -171,6 +234,7 @@ impl Framed for ToWorker {
         match self {
             ToWorker::Start { .. } => "start",
             ToWorker::StartGuest { .. } => "start_guest",
+            ToWorker::StartAuto { .. } => "start_auto",
             ToWorker::Answer => "answer",
             ToWorker::Cancel => "cancel",
         }
@@ -179,7 +243,11 @@ impl Framed for ToWorker {
 
 impl Framed for FromWorker {
     fn handles(&self) -> usize {
-        0
+        match self {
+            FromWorker::ReadyToStart { x_pidfd, .. } => usize::from(*x_pidfd),
+            FromWorker::Started { pidfd, .. } => usize::from(*pidfd),
+            _ => 0,
+        }
     }
 
     fn kind(&self) -> &'static str {
@@ -191,8 +259,15 @@ impl Framed for FromWorker {
             FromWorker::ReadyToStart { .. } => "ready_to_start",
             FromWorker::Started { .. } => "started",
             FromWorker::Ended { .. } => "ended",
+            FromWorker::Hold { .. } => "hold",
         }
     }
+}
+
+/// Tell `reclogind` that the worker enters or leaves a step that must not
+/// be cut short ([`FromWorker::Hold`]). A lost `reclogind` does not matter.
+pub fn hold(channel: &Channel, on: bool) {
+    let _ = channel.send(&FromWorker::Hold { on }, &[]);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,8 +448,19 @@ fn serve() -> Result<()> {
             session,
             console,
         }) => (user, session, console),
-        Some(Command::StartGuest { session, console }) => {
-            return crate::guest::worker_login(&channel, &signals, &session, console);
+        Some(Command::StartGuest {
+            session,
+            console,
+            wait,
+        }) => {
+            return crate::guest::worker_login(&channel, &signals, &session, console, wait);
+        }
+        Some(Command::StartAuto {
+            user,
+            session,
+            console,
+        }) => {
+            return crate::autologin::worker_login(&channel, &signals, &user, &session, console);
         }
         Some(other) => bail!("expected start, got {}", other.kind()),
         None => return Ok(()),

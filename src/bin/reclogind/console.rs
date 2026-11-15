@@ -6,6 +6,13 @@
 //! go ([`Console::allow_release`]); when it comes back the kernel sends
 //! `SIGUSR2` and we acknowledge ([`Console::acknowledge_acquire`]). Between
 //! the two the display and the input devices are given up.
+//!
+//! The order the two signals are read in says nothing: they are read
+//! lowest number first, and a quick switch to the login console and away
+//! leaves both waiting. Each is answered as the kernel requires, and then
+//! the kernel is asked which console is shown ([`Daemon::console_changed`]);
+//! that answer decides. Before the greeter is resumed, and after the display
+//! was taken, the login console is checked to be the one shown again.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -14,6 +21,9 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{bail, Context, Result};
 use reclogin::log;
+use reclogin::protocol::ToGreeter;
+
+use crate::{Daemon, Next, WHO};
 
 const KDGETMODE: libc::c_ulong = 0x4B3B;
 pub const K_XLATE: libc::c_int = 1;
@@ -157,6 +167,17 @@ impl Console {
         ioctl_value(&self.tty0, VT_WAITACTIVE, number as libc::c_int)
     }
 
+    /// Whether the login console is the one shown now, asked of the kernel.
+    /// `false` when it cannot be asked.
+    pub fn is_shown(&self) -> bool {
+        active_of(self.tty0.as_raw_fd()) == Some(self.number)
+    }
+
+    /// The console shown now, asked of the kernel.
+    pub fn active(&self) -> Option<u32> {
+        active_of(self.tty0.as_raw_fd())
+    }
+
     /// Ask for console `number` to be shown, without waiting.
     pub fn switch_to(&self, number: u32) -> io::Result<()> {
         ioctl_value(&self.tty0, VT_ACTIVATE, number as libc::c_int)
@@ -277,4 +298,110 @@ pub fn graphics_mode(tty: RawFd) -> io::Result<bool> {
         return Err(io::Error::last_os_error());
     }
     Ok(mode == KD_GRAPHICS)
+}
+
+impl Daemon {
+    /// After the console signals waiting were answered: act on which
+    /// console the kernel says is shown, never on the order they came in.
+    pub(crate) fn console_changed(&mut self) -> Next {
+        if !self.console.is_shown() {
+            if self.shown {
+                self.release_display();
+            }
+            return Next::Continue;
+        }
+        // A session is starting or runs (its console comes back), or the
+        // last one is still closing (a greeter is started now): `login.rs`.
+        if let Some(next) = self.login_on_acquire() {
+            return next;
+        }
+        if self.shown {
+            return Next::Continue;
+        }
+        self.show_greeter()
+    }
+
+    /// The login console is shown: the display taken, and the greeter given
+    /// its display and state (started while the console was not shown) or
+    /// resumed. Each only while the login console is still the one shown.
+    pub(crate) fn show_greeter(&mut self) -> Next {
+        let reopened = match self.take_display_for_greeter() {
+            Some(reopened) => reopened,
+            None => return Next::Continue,
+        };
+        self.shown = true;
+        self.logind_shown();
+        if reopened {
+            // The greeter holds the old device: a fresh one gets the new one.
+            // Its going is reclogind's doing and not counted.
+            self.stop_greeter();
+            self.inputs.revoke_all();
+            return match self.supervisor.launch_until_up(&self.display, true) {
+                Ok(greeter) => {
+                    self.greeter = greeter;
+                    self.login_after_handshake()
+                }
+                Err(reason) => self.give_up(&reason),
+            };
+        }
+        if self.supervisor.handshake_pending {
+            // Started while the console was not shown.
+            return self.finish_handshake();
+        }
+        self.greeter.shown_again();
+        self.send(&ToGreeter::Resume)
+    }
+
+    /// After a session ended, whether the login console should be shown:
+    /// only when the console shown is the ended session's own, or belongs
+    /// to no user session on this seat (a bare text login prompt, say). A
+    /// person who moved to another session stays there. When the shown
+    /// console cannot be asked, yes, as before.
+    pub(crate) fn login_console_wanted(&self, ended: Option<u32>) -> bool {
+        match self.console.active() {
+            None => true,
+            Some(active) => Some(active) == ended || !self.logind.session_on(active),
+        }
+    }
+
+    /// Become the display's master for a greeter on the login console: on
+    /// failure the device is closed and opened once more. `Some(reopened)`
+    /// when the login console is still the one shown afterwards (taking can
+    /// wait two seconds); `None` (the display given up again) when it is not.
+    /// Failing to take it is logged and the greeter goes ahead: one that
+    /// cannot set a mode says so in its exit status and is counted.
+    pub(crate) fn take_display_for_greeter(&mut self) -> Option<bool> {
+        let mut reopened = false;
+        if let Err(e) = self.display.take() {
+            log(
+                WHO,
+                format_args!(
+                    "taking the display {}: {e}; opening it again",
+                    self.display.path
+                ),
+            );
+            match self.display.reopen() {
+                Ok(()) => {
+                    reopened = true;
+                    if let Err(e) = self.display.take() {
+                        log(
+                            WHO,
+                            format_args!("taking the display {} again: {e}", self.display.path),
+                        );
+                    }
+                }
+                Err(e) => log(WHO, format_args!("opening the display again: {e:#}")),
+            }
+        }
+        if !self.console.is_shown() {
+            log(
+                WHO,
+                "the login console was left while the display was being taken",
+            );
+            self.display.give_up_quietly();
+            self.shown = false;
+            return None;
+        }
+        Some(reopened)
+    }
 }

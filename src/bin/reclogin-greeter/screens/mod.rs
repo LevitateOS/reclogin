@@ -9,15 +9,17 @@
 //! [`conversation`] screen is drawn instead. [`other`] is "Other user…" and
 //! the screen of a system with no listed account; [`prompt`] is the guest and
 //! returning to a running session; [`shutdown`] is the question before a
-//! restart or shut down while others are logged in. Later stages add the
-//! rest of the design canvas (the on-screen keyboard, the second monitor,
-//! the text-login fallback) beside them. The open session menu is drawn over
+//! restart or shut down while others are logged in. [`keyboard`] is the login
+//! with the on-screen keyboard open; [`second`] is what the screens other than
+//! the primary one show. Later stages add the text-login fallback beside them. The open session menu is drawn over
 //! whichever screen it belongs to.
 
 pub mod conversation;
+pub mod keyboard;
 pub mod login;
 pub mod other;
 pub mod prompt;
+pub mod second;
 pub mod shutdown;
 
 use crate::form::Screen;
@@ -27,6 +29,10 @@ use crate::paint::Painter;
 pub fn draw(p: &mut Painter, v: &login::View) {
     if let Some(action) = v.form.question {
         shutdown::draw(p, v, action);
+        return;
+    }
+    if crate::osk::visible(v.form, v.state) {
+        keyboard::draw(p, v);
         return;
     }
     if v.form.talking() {
@@ -64,7 +70,11 @@ pub enum Target {
     Menu,
     Layout,
     OnScreenKeyboard,
+    /// A key of the on-screen keyboard.
+    Key(crate::osk::KeyId),
     Power(PowerAction),
+    /// "End the guest session" on the screen of a running guest session.
+    EndGuest,
 }
 
 /// The time as the screen shows it.

@@ -253,6 +253,23 @@ fn name_text_at(p: &mut Painter, name: &str, center: f32, color: reclogin::brand
     p.put(&laid, LEFT + 98.0, center - laid.height / 2.0);
 }
 
+/// "LOGGED IN" with its dot at the right end of a row; the width it takes.
+fn logged_in_mark(p: &mut Painter, center: f32) -> f32 {
+    let pal = p.palette();
+    let label = p.lay(
+        &[(
+            "LOGGED IN",
+            Style::new(Face::Sans, 11.0, pal.accent).tracking(0.14),
+        )],
+        None,
+        false,
+    );
+    let label_x = RIGHT_OF_LIST - label.width;
+    p.put(&label, label_x, center - label.height / 2.0);
+    p.fill_rect(label_x - 8.0 - 7.0, center - 3.5, 7.0, 7.0, pal.accent);
+    label.width + 8.0 + 7.0 + 18.0
+}
+
 pub(super) fn user_row(
     p: &mut Painter,
     top: f32,
@@ -287,18 +304,7 @@ pub(super) fn user_row(
 
     let mut room = LIST_W - 98.0;
     if logged_in {
-        let label = p.lay(
-            &[(
-                "LOGGED IN",
-                Style::new(Face::Sans, 11.0, pal.accent).tracking(0.14),
-            )],
-            None,
-            false,
-        );
-        let label_x = RIGHT_OF_LIST - label.width;
-        p.put(&label, label_x, center - label.height / 2.0);
-        p.fill_rect(label_x - 8.0 - 7.0, center - 3.5, 7.0, 7.0, pal.accent);
-        room -= label.width + 8.0 + 7.0 + 18.0;
+        room -= logged_in_mark(p, center);
     }
     name_text_at(
         p,
@@ -549,7 +555,9 @@ pub(super) fn draw_list(p: &mut Painter, v: &View, grid_top: f32) {
             if chosen { pal.text } else { pal.text_secondary },
             LIST_W,
         );
-        if !chosen {
+        if crate::form::guest_running(v.state) {
+            logged_in_mark(p, center);
+        } else if !chosen {
             let note = p.lay(
                 &[("Nothing is kept after logout", sans(13.0, pal.text_muted))],
                 None,

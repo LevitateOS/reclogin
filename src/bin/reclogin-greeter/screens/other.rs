@@ -91,7 +91,7 @@ pub fn draw(p: &mut Painter, v: &View) {
 }
 
 /// The user name field: plain text, 20 units, the focus ring in the accent.
-fn user_name_field(p: &mut Painter, v: &View, top: f32) {
+pub(super) fn user_name_field(p: &mut Painter, v: &View, top: f32) {
     let pal = p.palette();
     let focused = v.form.focus == Focus::UserName;
     p.fill_rect(FORM_X, top, FIELD_W, FIELD_H, pal.surface_sunken);

@@ -30,7 +30,7 @@ storage that is overwritten after use (see "Secrets on the way").
 
 | File | Read by | What |
 |---|---|---|
-| `/etc/reclogin.conf` | reclogind | `key = value` lines: `autologin`, `autologin_session`, `guest` (`on`/`off`, default `on`), `idle_seconds`. Unknown keys are reported and ignored. Stage 1 uses `guest` and `idle_seconds` only (passed to the screen). |
+| `/etc/reclogin.conf` | reclogind | `key = value` lines: `autologin`, `autologin_session`, `guest` (`on`/`off`, default `on`), `idle_seconds`. Unknown keys are reported and ignored. `autologin` and `autologin_session`: see "Automatic login". |
 | `/etc/passwd`, `/etc/shells` | reclogind | The users in the list: uid 1000 to 60000, a shell from `/etc/shells` when it exists, an existing home. |
 | `/usr/share/wayland-sessions/*.desktop`, `/usr/share/xsessions/*.desktop` | reclogind | The sessions. Not offered: `Hidden=true` or `NoDisplay=true`, a `TryExec` or an `Exec` program that does not exist. A Wayland and an X file of the same name (file name or `Name=`): the Wayland one. |
 | `/etc/X11/xorg.conf.d/*.conf` | reclogind | `XkbLayout`, `XkbVariant`, `XkbModel`, `XkbOptions` (both OSes: the installer's `x11-keyboard` writes `00-keyboard.conf`); a comma list is several layouts; `us` without them. Names from `/usr/share/X11/xkb/rules/evdev.xml`. |
@@ -73,7 +73,7 @@ storage that is overwritten after use (see "Secrets on the way").
 # One frame of the login screen to a PNG; opens no device and no socket.
 reclogin-greeter --render-png out.png --brand-dir assets/levitateos \
     [--size 1280x800] [--state assets/dev/state-levitateos.json] \
-    [--at '2026-11-15 21:42'] [--typed 12]
+    [--at '2026-11-15 21:42'] [--typed 12] [--second-screen]
 
 # The login screen on another console, with another greeter or account.
 reclogind --console 8 --greeter target/debug/reclogin-greeter \
@@ -105,8 +105,13 @@ Worker and reclogind speak their own small message set (same socket kind and
 framing as the greeter's): to the worker `start {user, session, console}`,
 `answer` (the secret follows as a raw packet), `cancel`; from the worker
 `prompt {kind, text}`, `message {kind, text}`, `failed {text}`, `accepted`,
-`ready_to_start {console, x_server}`, `started {console, desktop}` (the
-desktop's process group), `ended {status}`.
+`ready_to_start {console, x_server, x_pidfd}`, `started {console, desktop,
+pidfd}` (the desktop's process group; with `x_pidfd`/`pidfd` true the
+process's descriptor from `pidfd_open` comes with the message as a handle),
+`ended {status}`, and `hold {on}` around the steps that must not be cut
+short (the guest's cleanup and home, opening and closing the PAM session).
+`start_guest {session, console, wait}` and `start_auto` take the place of
+`start` for the guest and the automatic login.
 
 ### The PAM service
 
@@ -201,8 +206,13 @@ for it with its main loop running, and only after it is gone (and one
 second has passed since a failed or cancelled attempt, so PAM's failure
 delay cannot be skipped by cancelling) does a new `begin` start a worker.
 A `cancel` that ended a login is answered with `auth_result {ok: false}` once
-the worker is gone. A worker that has not exited fifteen seconds after being
-asked is logged loudly and killed, and reclogind gives its console back
+the worker is gone; a worker that ends before the greeter was let go
+without saying `failed` (a signal while the X server started, say) gets
+"The login could not be completed." then, so every attempt gets exactly one.
+A worker that has not exited fifteen seconds after being asked (or a minute
+after its desktop ended) is logged loudly and killed, except while it is in
+a step it announced with `hold`, which holds the kill off for up to two
+minutes (fifteen seconds again after the step), and reclogind gives its console back
 itself (text mode, hang-up, root, `tty`, 0620). The greeter sends `cancel` at most
 once per attempt, then shows "Cancelling…" and stays busy, sending no
 `begin`, until that `auth_result` (or the attempt's own, if it crossed the
@@ -211,7 +221,11 @@ cancel) arrives; questions and messages that arrive meanwhile are dropped.
 A worker that goes away while its desktop starts or runs (it crashed, was
 killed) leaves the desktop to reclogind: it ends the desktop's and the X
 server's process groups (reported in `ready_to_start` and `started`;
-SIGTERM, SIGKILL after ten seconds, without stopping its loop), gives the
+SIGTERM, SIGKILL after ten seconds, without stopping its loop; a group is
+signalled only while its leader lives, checked through the process
+descriptor sent with the message, since its number alone could belong to
+another process by then; a group whose leader is gone is left to the login
+service, and what stayed in it may run on until it ends by itself), gives the
 console back, logs it, and only then shows the login screen. A panic in the
 PAM conversation is caught and refuses the conversation.
 
@@ -271,10 +285,11 @@ same steps as above, with the X server started in between
    as an MIT-MAGIC-COOKIE-1, in an X authority file the worker writes itself
    with the user's file-system ids (so it is the user's), mode 0600, opened
    with `O_CREAT|O_EXCL|O_NOFOLLOW`: `$XDG_RUNTIME_DIR/reclogin-xauth-<random>`
-   from the PAM environment, else `/tmp/reclogin-xauth-<uid>-<random>`. One
-   entry in libXau's format: family 256 (local), the host name from
-   `gethostname`, the display number, the name `MIT-MAGIC-COOKIE-1`, the
-   cookie; each field a big-endian 16-bit length and its bytes, the family a
+   from the PAM environment, else `/tmp/reclogin-xauth-<uid>-<random>`. Two
+   entries in libXau's format: family 256 (local) with the host name from
+   `gethostname`, and family 65535 (any host) with an empty address, so that
+   clients still find the cookie when the host name changes; each with the
+   display number, the name `MIT-MAGIC-COOKIE-1` and the same cookie; each field a big-endian 16-bit length and its bytes, the family a
    big-endian 16-bit number. It is written first with an empty number (the
    server reads every cookie in its file whatever the number) and rewritten
    with the number once the server has said it.
@@ -298,8 +313,12 @@ same steps as above, with the X server started in between
    `reclogind` decides which console is shown. No `-noreset` (XLibre
    refuses it). The server switches to console N itself; `reclogind` pauses
    the greeter on that switch as on any other.
-5. Its standard output and error go to a pipe; the worker writes every line
-   to the system log as `X server: <line>`. The server writes its own full
+5. Its standard output and error go to a pipe (which the user can write to
+   as well); the worker writes its lines to the system log as
+   `X server: <line>`, in constant memory: at most 64 KiB read per turn,
+   lines cut at 1024 bytes, at most 50 lines a second and then one "N more
+   lines dropped". The display number's pipe is read up to 32 bytes; more
+   without a newline fails the start. The server writes its own full
    log itself: without root rights (the wrapper gives them up when every
    display device has a kernel driver) to `$XDG_DATA_HOME/xorg/Xorg.N.log`,
    else `~/.local/share/xorg/Xorg.N.log`; with root rights to
@@ -393,7 +412,13 @@ signal of the manager, the sessions and the seat (`SessionNew`,
 `SessionRemoved`, `PropertiesChanged`, `PrepareForSleep`, ...) wakes the
 helper; it reads again 150 ms after the last one, on `refresh`, and every
 five seconds whatever happens. A report is sent only when it changed. The
-sessions reported are those on `seat0`, class `user`, state not `closing`.
+sessions reported are every session of class `user` whose state is not
+`closing`, on any seat or on none (logged in over the network: `Remote`).
+The logged-in marks of the list, returning and the foreground session use
+only those on `seat0` with a console of their own; the power question names
+everyone with a session (remote ones marked as such). A request the helper
+does not answer within 15 seconds fails for the greeter, and the helper is
+ended and started again.
 With no bus (not up yet, or gone) it reports `available: false` and tries
 again every two seconds. A method call that gets no answer in 25 seconds is
 an error.
@@ -429,8 +454,14 @@ display is taken back with "The session did not come to the front."
 
 **Power.** The footer's Sleep, Restart and Shut down send
 `power {action, confirmed: false}`. With nobody logged in `reclogind` asks
-the helper. With others logged in, Restart and Shut down open the question
-screen (`screens/shutdown.rs`, `AcornShutDown.dc.html`): "Shut down for
+the helper. With others logged in, the question is `reclogind`'s, not the
+greeter's: for Restart and Shut down it answers `power_question {action,
+people}` (who is logged in, remote ones marked), and `confirmed: true` is
+honoured only for that action, within a minute of that question, and only
+while nobody has logged in since; otherwise it asks again, whatever the
+greeter sends. An accepted Restart or Shut down that has not happened 90
+seconds later is given up and the greeter told. The greeter shows the
+question screen (`screens/shutdown.rs`, `AcornShutDown.dc.html`): "Shut down for
 everyone?" or "Restart for everyone?", who is logged in, "... anyway"
 (sends `confirmed: true`) and "Cancel", the footer action marked. Sleep asks
 nothing. `reclogind` refuses an unconfirmed Restart or Shut down while
@@ -479,46 +510,75 @@ of it is swept.
 
 ### Step by step
 
-1. **reclogind starts.** It checks the account and, when it is the guest,
-   runs the cleanup (below) before it takes the console, also with
-   `guest = off`. The screen gets the Guest entry when the setting is on and
-   the account is the guest.
+1. **reclogind starts.** It checks the account. When it is the guest, it
+   takes the guest lock and starts the cleanup (below) in a child process,
+   `reclogind --guest-cleanup --setid-walk`, which gets the lock as
+   descriptor 3; also with `guest = off`. The main process stays
+   single-threaded and reaps the child from its loop without waiting. The
+   screen gets the Guest entry when the setting is on, the account is the
+   guest, no cleanup child runs, the last cleanup did not fail and the
+   start's search for set-id files finished clean (`guest::offered`, asked
+   each time a state is built; the account check is read again only when
+   `/etc/passwd`, `/etc/shadow` or `/etc/group` changed). A fresh state goes
+   to the greeter whenever a cleanup child starts or ends. A failed
+   cleanup runs again after 1 minute, then 2, 4, ... at most 30.
 2. **`begin {who: guest}`.** Refused with "The guest session is switched
-   off." (`guest = off`) or "The guest session is not available." (no valid
-   account). A typed `guest` under "Other user…" fails like a wrong
-   password, before PAM, and the worker refuses the name `guest` and uid
-   60600 in the normal `reclogin` service as well. Otherwise the session is
-   chosen as for a person and a worker is started with `start_guest
-   {session, console}` (a message of its own; `start` is unchanged).
+   off." (`guest = off`), "The guest session is not available." (no valid
+   account) or "The guest session is still being cleared. Try again in a
+   moment." (a cleanup runs or failed). A typed `guest` under "Other user…"
+   fails like a wrong password, before PAM, and the worker refuses the name
+   `guest` and uid 60600 in the normal `reclogin` service as well. Otherwise
+   the session is chosen as for a person and a worker is started with
+   `start_guest {session, console, wait}`; `wait` is set only for the
+   automatic login, which comes while the start's cleanup runs and waits up
+   to 110 seconds for it.
 3. **The worker takes the guest lock** (`/run/reclogin/guest.lock`, `flock`,
    held to the end of its logout cleanup). Held by a guest session: "A guest
-   session is already running." Held by a cleanup: "The guest session is
-   still being cleared. Try again in a moment."
-4. **The cleanup.** A guest login only starts when it finished completely;
-   otherwise the screen gets "The guest session is still being cleared. Try
-   again in a moment."
+   session is already running." Held by a cleanup (or by a holder whose
+   line cannot be trusted): "The guest session is still being cleared. Try
+   again in a moment." The holder line is 32 bytes written in one call over
+   the old one, never emptied, and trusted only while the process it names
+   lives and is a worker or a cleanup child.
+4. **The cleanup**, without the login service (below). A guest login only
+   starts when it finished completely; otherwise the screen gets "The guest
+   session is still being cleared. Try again in a moment."
 5. **The home.** `/run/reclogin` (root, 0755) and `/run/reclogin/guest`
    (root, 0000); a tmpfs mounted there with
    `size=<a quarter of memory, at most 4 GiB>,mode=0700,uid=60600,gid=60600`
    and `nosuid,nodev`; checked to be a tmpfs (statfs), a mount (its device
-   differs from `/run/reclogin`'s), the guest's, mode 0700 and empty;
-   `/etc/skel` and then `/usr/share/reclogin/guest-home/` copied in, owned by
-   the guest (folders, files, links; set-id bits dropped).
+   differs from `/run/reclogin`'s), the guest's, mode 0700 and empty. Then a
+   child process that has fully become the guest (no groups; real,
+   effective and saved uid and gid 60600; checked) copies `/etc/skel` and
+   then `/usr/share/reclogin/guest-home/` in (folders, files, links; only
+   the permission bits, never set-id ones; what the guest may not read is
+   left out), so root never works on a path inside the guest's home. Steps
+   3 to 5 are announced to reclogind as a step not to be cut short (`hold`).
 6. **PAM** `reclogin-guest` for the user `guest`, `PAM_TTY` set, then
    authenticate and account. No conversation: a question from any module is
    refused (`Talk::silent`), which fails the login. A module that changes
    the user away from `guest` fails it too. Then `accepted`.
 7. **The usual path** (`session::run`): console, PAM session, X or Wayland,
-   the desktop, its end. One difference: after `pam_open_session` the PAM
+   the desktop, its end. Differences: after `pam_open_session` the PAM
    environment must hold `XDG_SESSION_ID` (the login service registered the
    session); without it the session is closed and the screen gets "The
-   session could not be started." The guest is never written to `last.json`.
+   session could not be started." The desktop's process and the X server's
+   process install no-new-privileges and a seccomp filter just before
+   `exec` (`nosetid.rs`): no process of the session can make a set-user-ID
+   or set-group-ID file anywhere, and no set-id program gains its rights in
+   it (`su`, `sudo`, `doas`, `crontab`, `at`, `fusermount`, `pkexec` do not
+   work; an X server that needs root because not every graphics card has a
+   kernel mode-setting driver does not start). On LevitateOS the guest's
+   `systemd --user` gets the same through
+   `dist/guest/user@60600.service.d/50-reclogin-guest.conf`. The guest is
+   never written to `last.json`.
 8. **Logout.** When the desktop has ended the worker closes the PAM session
    (and `pam_end`), says `ended`, runs the cleanup again (which ends every
    process of the guest and unmounts the home), and only then exits;
    reclogind brings the login screen back when the worker has exited, as for
-   anyone. A guest worker that went away without finishing its cleanup (or
-   whose cleanup failed) leaves it to a thread in reclogind.
+   anyone. After every guest worker, however it ended (killed included),
+   reclogind starts the cleanup child again, the only place that asks the
+   login service to end the guest: on LevitateOS the worker sits in the
+   guest's own session scope and would be ended by its own request.
 
 ### The cleanup routine
 
@@ -527,48 +587,272 @@ every guest logout. Each step is safe to repeat. The places are one list at
 the top of `guest.rs`.
 
 1. The guest lock stands for "the guest is logged in": a cleanup never runs
-   while a guest worker holds it (reclogind's own runs skip; the worker runs
-   it under its own hold).
-2. The login service is asked to end user 60600 (**not connected yet**: see
-   `ask_login_service_to_end_user`), then the uid sweep: a helper process
-   drops to uid and gid 60600 (no groups; it checks it really did) and sends
-   `SIGKILL` to every process it may signal; repeated until `/proc` shows no
-   process with real or saved uid 60600 (zombies aside), for up to ten
-   seconds.
-3. Everything mounted at or under `/run/reclogin/guest`, `/run/media/guest`
-   and `/run/user/60600` is unmounted, deepest first; a busy one is detached.
-4. Everything of uid 60600 under `/tmp`, `/var/tmp`, `/dev/shm` and
-   `/dev/mqueue` is removed (a folder of the guest's with all it holds).
+   while a guest worker holds it (reclogind starts no child then and tries
+   again later; the worker runs it under its own hold).
+2. Scheduled jobs first, so nothing starts a guest process after the sweep:
+   `/var/spool/cron/guest`, `/var/spool/cron/crontabs/guest`, and every
+   entry of uid 60600 in `/var/spool/at`, `/var/spool/cron/atjobs` and
+   `/var/spool/cron/atspool`.
+3. In the cleanup child only: `TerminateUser(60600)` through the one-shot
+   `reclogind --end-user 60600` (at most five seconds; a courtesy). Then the
+   uid sweep: a helper process takes no groups, the gid of `reclogin-sweep`,
+   real and effective uid 60600 with saved uid 60601 (clearing the guest's
+   user and user-session keyrings, which the kernel finds by the real uid),
+   then real uid 60601 and effective uid 60600, checks every id and that no
+   other process has uid 60601, and calls `kill(-1, SIGKILL)`. The kernel
+   lets a process without `CAP_KILL` signal a target when the sender's real
+   or effective uid equals the target's real or saved uid, so the helper
+   reaches exactly the processes whose real or saved uid is 60600 (or 60601,
+   nobody), and no guest process can signal it (its real and saved uid are
+   60601). A helper that does not finish in three seconds is killed; the
+   sweep repeats until `/proc` shows no process with real or saved uid 60600
+   (zombies aside), for up to ten seconds, and fails after three helpers
+   that did not finish. `reclogin-sweep` must be exactly uid 60601
+   (`dist/sysusers/reclogin.conf`); without it the sweep and the cleanup
+   fail.
+4. Everything of the guest's mounted is detached: at or under
+   `/run/reclogin/guest`, `/run/media/guest` and `/run/user/60600`, and a
+   FUSE mount of the guest's (`user_id=60600`) under a shared place. Each
+   mount is opened from `/` one name at a time without following links,
+   checked to be the very mount (its id in `/proc/self/mountinfo`) and
+   detached through `/proc/self/fd/N`; nothing else is ever unmounted.
 5. Removed whole when present: `/run/reclogin/guest`, `/run/media/guest`,
-   `/run/user/60600`, `/var/spool/cron/guest`,
-   `/var/spool/cron/crontabs/guest`, `/var/lib/systemd/linger/guest`,
+   `/run/user/60600`, `/var/lib/systemd/linger/guest`,
    `/var/lib/elogind/linger/guest`, `/var/lib/AccountsService/users/guest`,
    `/var/lib/AccountsService/icons/guest`.
-6. System V shared memory, semaphores and message queues whose owner or
+6. Everything of uid 60600 under `/tmp`, `/var/tmp`, `/dev/shm` and
+   `/dev/mqueue` is removed (a folder of the guest's with all it holds).
+7. The per-user journal files of uid 60600 (`user-60600*.journal*` in each
+   machine folder of `/var/log/journal` and `/run/log/journal`) and
+   systemd-coredump's dumps of uid 60600 in `/var/lib/systemd/coredump`.
+8. System V shared memory, semaphores and message queues whose owner or
    creator is uid 60600 (`/proc/sysvipc/`) are removed.
-7. The check: no such process, nothing mounted under those places, none of
-   the paths of step 5, nothing of uid 60600 in the places of step 4, no
-   such System V object (shared memory already marked for removal aside).
-   Only then is it "finished completely". Otherwise the mark
-   `/run/reclogin/guest-cleanup-failed` is written (and removed by the next
-   clean pass), and the log says what is left.
+9. At start only (`--setid-walk`): every mounted local file system that is
+   written to and allows set-id programs (no `nosuid`, not read-only, not
+   the kernel's own, not network or FUSE) is searched, each once and
+   staying on it, for files and folders of uid 60600 with a set-id bit;
+   the bits are taken away (through `/proc/self/fd/N` of a handle checked
+   to be the same file). The search may take 60 seconds; longer, or a place
+   it could not look at or fix, fails the check. When it finished clean the
+   mark `/run/reclogin/guest-setid-checked` is written; until then no guest
+   starts. It walks every home and all of `/var`, too long to do before
+   each guest; the kernel filter of step 7 above is the guarantee and this
+   search the backstop, once per boot.
+10. The check: no such process, nothing of the guest's mounted (a FUSE mount
+    of uid 60600 anywhere counts), none of the paths of steps 2 and 5,
+    nothing of uid 60600 in the places of steps 2 and 6, no journal file or
+    core dump of step 7, no such System V object (shared memory already
+    marked for removal aside). Only then is it "finished completely".
+    Otherwise the mark `/run/reclogin/guest-cleanup-failed` is written (and
+    removed by the next clean pass), and the log says what is left.
 
 Every file walk works from open folder handles (`openat`, `fstatat`,
-`unlinkat`), never follows a link and never leaves the file system it
-started on. It goes 256 folders deep; a deeper tree of the guest's is not
-removed and fails the check.
+`unlinkat`), never follows a link and never enters another mount. It has no
+depth limit: it keeps only the handle of the folder it is in and climbs
+back with `..`, checked to be the folder it came from; when a folder moved
+meanwhile it begins again from its top (at most 64 times). The removal
+walks of one cleanup, and its check, may take 30 seconds each. An entry
+that cannot be looked at, opened or removed for any reason but "does not
+exist" fails the check, unless it is someone else's mount point that root
+may not look into.
 
 ### Files under dist/ for the guest
 
 | File | Installed as | Design point |
 |---|---|---|
-| `dist/sysusers/reclogin.conf` (the `g guest` and `u guest` lines) | `/usr/lib/sysusers.d/reclogin.conf` | 1, 6 |
+| `dist/sysusers/reclogin.conf` (the `g guest`, `u guest` and `u reclogin-sweep` lines) | `/usr/lib/sysusers.d/reclogin.conf` | 1, 3, 6 |
 | `dist/pam/reclogin-guest.levitateos`, `dist/pam/reclogin-guest.acornos` | `/etc/pam.d/reclogin-guest` | 4 |
 | `dist/guest/50-reclogin-guest.limits.conf` | `/etc/security/limits.d/50-reclogin-guest.conf` | 3 |
 | `dist/guest/50-reclogin-guest.sshd.conf` | `/etc/ssh/sshd_config.d/50-reclogin-guest.conf` | 4 |
-| `dist/guest/50-reclogin-guest.rules` | `/usr/share/polkit-1/rules.d/50-reclogin-guest.rules` | 1 (decisions 3 and 4) |
+| `dist/guest/50-reclogin-guest.rules` (an allow list: everything not on it is refused for the guest; no admin step) | `/usr/share/polkit-1/rules.d/50-reclogin-guest.rules` | 1 (decisions 3 and 4) |
+| `dist/guest/user@60600.service.d/50-reclogin-guest.conf` (LevitateOS only) | `/usr/lib/systemd/system/user@60600.service.d/50-reclogin-guest.conf` | 1 |
 | `dist/guest/reclogin-guest-notice` | `/usr/libexec/reclogin/reclogin-guest-notice`, mode 0755 | 5 |
 | `dist/guest/guest-home/` | `/usr/share/reclogin/guest-home/` (the guest defaults tree; desktop recipes add their own files) | 2, 5 |
+
+## Automatic login (stage 6)
+
+`/etc/reclogin.conf` names an account in `autologin` (or `guest`) and
+optionally a session in `autologin_session`; `src/bin/reclogind/autologin.rs`
+does the rest. No countdown, no screen first: the session starts, and when it
+ends the login screen appears, as after any logout.
+
+### Step by step
+
+1. `reclogind` starts as always (guest cleanup, login service, console,
+   greeter). With the greeter up, `Daemon::start_autologin` runs once from
+   `run`. Without an `autologin` line nothing happens. If a user session's
+   console is in front at that moment (a restart of `reclogind` under a
+   running desktop) it does not log anyone in.
+2. It creates `/run/reclogin/autologin-done` (`create_new`, mode 0600, no
+   symlink followed). If the file exists, this boot already tried: nothing
+   more, no line. If it cannot be made, nothing is tried and the screen says
+   so. `/run` is cleared at boot, so the next boot tries again.
+3. The account: `guest` goes through the guest's own path (refused when
+   `guest = off` or the account is not the guest; the cleanup and the home
+   are the worker's, `guest::worker_login`). Any other name must be on the
+   user list (`users::listable`: uid 1000 to 60000, a login shell, an
+   existing home), so root and system accounts are refused here.
+4. The session: `autologin_session` when installed; else the session that
+   user used last (`/var/lib/reclogin/last.json`) when installed; else the
+   first installed. None installed: refused.
+5. `Daemon::start_login` (`login.rs`), the code `begin` ends with (console,
+   worker), with the entry marked `Entry::Automatic`: the worker is sent
+   `start_auto` instead of `start`.
+6. The worker (`autologin::worker_login`) checks the account again itself
+   (on the list, not root, not uid 60600, the name is what it was given),
+   reads the session, and runs PAM's `reclogin-autologin` with no
+   conversation (`Talk::silent`: any question from a module is refused).
+   `pam_authenticate` and `pam_acct_mgmt` must succeed and the user must
+   still be the same; an expired password is refused with its own line
+   (changing it needs the login screen). Then the usual path, `session::run`.
+7. A failure at any step is one line on the login screen: "Automatic login
+   did not work." and the reason ("That account is not on the list of users,
+   so it cannot log in this way.", "The account was refused.", "The chosen
+   session is no longer installed.", the session's own refusals, ...). It
+   comes as `auth_result` with `ok: false`, prefixed by `Entry::line`, also
+   for the worker's own `failed`. After the session, or after the failure,
+   nothing logs in again.
+
+### Why it is not a way around the password
+
+The auth line of `reclogin-autologin` is `pam_permit`: that service accepts
+anyone. It is safe because it is reachable only like this: only `reclogind`'s
+start-up sends `start_auto` (the greeter has no message that leads to it; the
+worker's socket is private), only once per boot (the mark file, made before
+anything is tried), only for the account in the root-owned
+`/etc/reclogin.conf`, which the worker rechecks against the user list and
+root. Anyone who can write `/etc/reclogin.conf` or `/etc/pam.d` is root
+already. The account and session lines are those of `reclogin`, so locked or
+expired accounts and `pam_nologin` still refuse. The comment in the PAM files
+says nothing else may name the service.
+
+### The PAM service and the installer
+
+`dist/pam/reclogin-autologin.levitateos` and `.acornos` are installed as
+`/etc/pam.d/reclogin-autologin` (`installed_files` in
+`distro/builder/os-recipes/reclogin.rhai`). `dist/reclogin.conf` documents
+both keys.
+
+The installer's `autologin` command (`recipe-system-setup`,
+`distro/builder/guest/installed/system-setup.sh`) writes `autologin = USER`
+and `autologin_session = SESSION` into `/etc/reclogin.conf` when
+`/usr/bin/reclogind` exists in the system it configures (other lines kept;
+the two keys replaced in place or added), and the SDDM file otherwise. That
+SDDM branch goes at the switch. `recsetup` (`plan.rs`) accepts a target that
+has `reclogind` or `sddm` for `--autologin`.
+
+### The guest, two connections
+
+- **`TerminateUser`.** The guest cleanup's `ask_login_service_to_end_user`
+  runs `reclogind --end-user UID` (`loginhelper::end_user`): a one-shot
+  process (root only, signals unblocked, standard output closed) that
+  connects to the system bus as the helper does (the same address and
+  `connect_with`, a four-second call timeout), calls
+  `org.freedesktop.login1.Manager.TerminateUser(u)` and exits. The cleanup
+  waits at most five seconds (`END_USER_WAIT`), kills it after that, ignores
+  any failure, and goes on to its own sweep. `reclogind` itself stays
+  single-threaded.
+- **A running guest session.** The guest is not in `State::users`, but the
+  login service lists its session: `form::guest_running` (greeter) is true
+  when `State::running` has a session of user `guest`. The Guest row then
+  shows "LOGGED IN" like a user's, the Guest screen reads "Back to the guest
+  session." with a "Return to the guest session" button (`return_to` with
+  the name `guest`, handled by the existing `on_return_to`; no second guest
+  starts), the session line, and under the button a quiet underlined "End
+  the guest session". That one sends the new message `ToDaemon::EndGuest`;
+  `Daemon::on_end_guest` (`guest.rs`) calls `guest::end_running_session()`
+  and answers `auth_result` (`ok: true` when the worker was asked to end,
+  else the reason); the next state, which no longer has the guest running,
+  puts the normal Guest screen back.
+
+Protocol: one new message, `ToDaemon::EndGuest`; no existing shape changed.
+Between `reclogind` and its worker: `ToWorker::StartAuto` (`start_auto`).
+
+## Keyboard, touch, several monitors, idle (stage 8)
+
+All in the greeter. Drawing: `screens/keyboard.rs` (the login with the
+keyboard open, `LevitateKeyboard.dc.html`) and `screens/second.rs` (what the
+other monitors show, `LevitateSecondScreen.dc.html`). The keys' state and
+letters: `osk.rs`. Devices: `kms.rs`, `input.rs`. The rest is `watch.rs`.
+
+**The on-screen keyboard.** The footer's "On-screen keyboard" opens it. While
+it is open the user list is the chosen person with "Someone else" (on
+"Other user…": that row with "Choose from the list"; on a PAM question:
+"Someone else" cancels, as on the question screen), the headline is 56 units,
+the password field and "Log in" share a row, the footer and the session
+picker are not drawn, and five rows of keys 56 units high take the lower part
+(digits; `Q` row; `A` row with Enter; Shift, `Z` row, Delete; the symbols key,
+the layout key, space, "Hide keyboard"). It types into the form's focused
+field (password, user name, or a PAM answer) as a physical key does: it hands
+`Form::key` the same `Key` values, so what a physical key press does still
+works at the same time. A pressed key is drawn pressed until the frame after
+the pointer or finger is up. Not on the guest and return screens (no field),
+not on the power question; "Hide keyboard" closes it. The delete key does not
+repeat when held.
+
+The letters are not a fixed table: the keymap the greeter compiled for the
+current layout (`input::Input::key_table`) is asked, with
+`xkb_keymap_key_get_syms_by_level` for layout group 0, which character each
+of the 38 key positions gives at levels 1 to 4: evdev codes 2-11 (digits),
+16-25, 30-38 and 44-52 (`Z` to `.`). A German layout shows z and y where
+that layout has them. Shift is one-shot (the next character); pressed twice
+it locks ("Shift lock", drawn filled), a third press releases. Shift shows
+the layout's second level. The digit row types digits (on a layout that has
+them under Shift, such as French, they are shown plain). The symbols key
+("!#1", then "abc") switches the three letter rows to the layout's third
+level (Shift: fourth) when that level is a symbol layer: at least 14 of the
+28 keys have a character there and three quarters of those are not letters.
+Otherwise (US, German, most layouts: AltGr gives letters or nothing) it shows
+a **fixed table of common symbols**: page one `!@#$%^&*()`, `-_=+[]{};`,
+`:'"\|/<>?`; with Shift a second page (`~`,.€£¥°§±` and Latin-1 signs). The
+layout key switches the layout like the footer's switcher (nothing happens
+with one layout). The keymap is read again whenever the layout changes.
+
+**Touch.** libinput touch-down, motion and touch-up (the first finger down;
+others are ignored until it is lifted) drive the pointer logic: a touch is a
+click at that point (`Happening::Touch` becomes `Press`), and the hardware
+and drawn pointers are hidden until the mouse moves. A touch on the password
+or user name field opens the keyboard when no physical key has been pressed
+since the greeter started. Touch coordinates are mapped onto the primary
+screen (libinput cannot tell which monitor a touch screen belongs to).
+
+**Several monitors.** Every connected connector gets a mode and two buffers,
+each on a pipeline of its own. The primary is the first connected built-in
+panel (eDP, LVDS, DSI), else the first connected screen in the kernel's
+order; it shows the login and holds the pointer (the pointer is clamped to
+its size and the hardware cursor is set on its pipeline only). Every other
+screen shows the background art with the mark, the OS name and "Log in on the
+other screen.", drawn once for a screen and redrawn only when the brand's
+name or that screen's size differs from what it shows. Each screen is
+scaled by itself from the 1920x1080 design. **A plugged or removed screen is
+noticed by looking at the connectors again every three seconds**
+(`Screen::rescan`, `get_connector` without probing the hardware, so it reads
+what the kernel's own hotplug handling keeps): the kernel announces it by a
+uevent on a netlink socket, which the greeter's lock-down refuses to open
+(no new sockets), and the display handle carries only page-flip events.
+When the primary goes, the login moves to the next screen (the frame, the
+pointer's box and the drawn login follow its size) and the former primary
+shows the other-screen picture. When the last screen goes the old state is
+kept. Screens found while the screens are off are drawn when they wake.
+
+**Idle.** After `idle_seconds` (from `reclogin.conf`; unset or 0 is never)
+without a key, pointer motion or touch the greeter sets the connector
+property `DPMS` of every screen to Off and stops drawing. Any input sets it
+On again and is not passed to the form (a held key's repeat is dropped as
+well). A connector without a `DPMS` property has its pipeline disabled
+(`set_crtc` with no buffer) instead, and the mode is set again by the next
+frame. After 60 seconds without input a typed password (also a PAM answer
+being typed) and a typed user name are cleared, with the line "The password
+was cleared after a minute without input." (and its user-name variants). A
+console switch away and back counts as a fresh idle period.
+
+`reclogin-greeter --render-png out.png --brand-dir assets/levitateos --state
+assets/dev/state-levitateos-keyboard.json --at '2026-11-15 21:42'` draws the
+keyboard (`state-*-keyboard.json`; `-keyboard-shift.json` with Shift;
+`state-levitateos-keyboard-de.json` a German layout;
+`-keyboard-symbols.json` the symbols page with Shift lock). A sample's
+`keyboard`, `shift` (`once`/`lock`) and `symbols` set it up.
+`--second-screen` draws the other monitors' picture.
 
 ## Starting, restarting, giving up (stage 9)
 
@@ -608,9 +892,14 @@ removed and fails the check.
   sent from the main loop. A greeter whose queue has not moved for five
   seconds, or whose queue is full, is hung: killed and counted as a failure
   like a crash.
-- **Liveness.** While console 7 is shown reclogind sends `ping {seq}` every
-  three seconds (one at a time); a greeter that has not answered with
-  `pong {seq}` within ten seconds is hung: killed and counted as a failure.
+- **Liveness.** A greeter has a minute from getting its display and state
+  to say `ready` (fonts and the first mode set are slow on slow machines);
+  one that has not is hung. From `ready` on, while console 7 is shown,
+  reclogind sends `ping {seq}` every three seconds (one at a time); a
+  greeter that has not answered with `pong {seq}` within ten seconds is
+  hung: killed and counted as a failure. The five-second limit on a queue
+  that does not move also counts from `ready`. While console 7 is not shown
+  none of it runs.
 - If reclogind panics or gets a fatal signal (SIGSEGV, SIGBUS, SIGILL,
   SIGFPE, SIGABRT, SIGQUIT, SIGSYS, SIGTRAP, SIGXCPU, SIGXFSZ), a panic hook
   and signal handlers give the console back from numbers recorded when it
@@ -665,7 +954,7 @@ compiles the crate per OS in that OS's apps-build root, against its libpam,
 libinput and libxkbcommon (`distro/builder/src/login_screen.rs`), and lays
 out the tree with every file's mode in one list (`installed_files` in
 `distro/builder/os-recipes/reclogin.rhai`): the programs in `/usr/bin`,
-`/etc/pam.d/reclogin` and `reclogin-guest`, `/etc/reclogin.conf`,
+`/etc/pam.d/reclogin`, `reclogin-guest` and `reclogin-autologin`, `/etc/reclogin.conf`,
 `/usr/lib/sysusers.d/reclogin.conf`, the brand folder `/usr/share/reclogin`
 (`brand.json`, `background.png`, `fonts/` with the `OFL-*.txt` licences,
 `guest-home/`), the guest's files where "Files under dist/ for the guest"
@@ -734,24 +1023,43 @@ Everything of `docs/reclogin-plan.md` after stage 1 except stages 2, 3, 4, 5 and
   not refused by inhibitors on these images (when it is, the service's
   reason is shown). Not done: a session without a console (`VTNr` 0) cannot
   be returned to (said on the screen); only the newest session of a user is
-  returned to; no Hibernate; the guest entry is not marked as logged in and
-  the guest's `TerminateUser` is not on the helper; a power call that hangs
+  returned to; no Hibernate; a power call that hangs
   holds the helper (not `reclogind`) for up to 25 seconds, and the greeter
   shows nothing while it waits; after Sleep nothing on the screen says the
   machine woke; a restart or shut down leaves no "going down" screen;
-- automatic login (stage 6), also to the guest (owner's decision 7): it is
-  to use the same `begin {who: guest}` path, refused when `guest = off`;
+- automatic login (stage 6, "Automatic login" above) is written and
+  compile-checked, never run: no worker was started, `reclogin-autologin`
+  was not called by any PAM module of either OS, nothing was logged in. Not
+  seen: `pam_permit` plus the account and session lines of each OS's own
+  `reclogin` file in `reclogin-autologin` (AcornOS's `base-account` and
+  `base-session` against that file's include lines, as for the guest);
+  whether the login service registers a session opened with no password
+  conversation like a normal one; whether wallets without a password
+  (`pam_kwallet5`, `pam_gnome_keyring` with `auto_start`) behave in the
+  session (they cannot unlock, so the desktop asks later). Not done: the
+  greeter is already up when the worker starts, so the login screen can
+  show for the moments the worker takes (starting before the greeter would
+  need `login.rs` to work without one); no countdown or way to cancel
+  (decision 2); a user whose home is encrypted or mounted by their password
+  is not supported; a failed automatic login says why in one line and the
+  logs (journal or syslog) say more;
 - stage 7 (above) is written and compile-checked, never run: no tmpfs was
-  mounted, no sweep run, no file removed, no PAM module called. Not
-  connected: `TerminateUser(60600)` on `org.freedesktop.login1.Manager`
-  (`ask_login_service_to_end_user` in `guest.rs` logs and does nothing; the
-  uid sweep runs without it); `state.rs` still offers Guest from the setting
+  mounted, no sweep run, no file removed, no PAM module called. 
+  `reclogind --end-user 60600` calling `TerminateUser` is written, never
+  run (whether logind and elogind accept it from the one-shot with no
+  session of its own, and whether the dbus daemon is up at `reclogind`'s
+  start; if not the call fails within moments and the sweep goes on);
+  `state.rs` still offers Guest from the setting
   as known at start (main.rs gives it the setting and the account), not from
   `guest::offered`, so a cleanup that fails later hides nothing until
-  reclogind restarts (a guest attempt still gets the plain line); "End the
-  guest session" from a locked guest (`guest::end_running_session`, for the
-  stage that returns to sessions) and the Guest entry marked as logged in
-  are not wired. Step 1 of the cleanup asks the guest lock, not the login
+  reclogind restarts (a guest attempt still gets the plain line). The
+  Guest row marked as logged in, the return to a running guest session and
+  "End the guest session" are written ("The guest, two connections") but
+  only compile-checked, never rendered or run: the quiet button has no
+  keyboard focus (pointer and touch only); a guest session of this
+  reclogind's own worker cannot be reached from the screen anyway (no greeter
+  runs while it does), so this is for one that outlived a restart of
+  `reclogind`. Step 1 of the cleanup asks the guest lock, not the login
   service: a guest session whose worker and reclogind both died is swept at
   the next start. Not seen on a real system: `pam_succeed_if`, `pam_permit`,
   `pam_limits`, `pam_unix` in AcornOS's linux-pam; `pam_systemd` and
@@ -761,8 +1069,22 @@ Everything of `docs/reclogin-plan.md` after stage 1 except stages 2, 3, 4, 5 and
   "nobody"; the notice shown by Plasma and LXQt; `/bin/bash` on AcornOS (the
   session falls back to `/bin/sh` when it is missing; a terminal opened in
   the session uses the account's shell);
-- the on-screen keyboard, several monitors, idle switch-off, input devices
-  plugged in after start (stage 8);
+- stage 8 (above) is written and compile-checked, never run: no key was
+  pressed on the on-screen keyboard, no touch screen was used, no second
+  monitor was plugged, no screen was switched off; only `--render-png` drew
+  it. Not seen: that `DPMS` works on a driver's connector for an
+  unprivileged master (and what a driver without it does with a disabled
+  pipeline); that the connectors' state read without probing changes after a
+  hotplug within the three seconds on every driver (analog outputs are
+  polled by the kernel's own work, which may be off); that a CRTC is free
+  for every extra screen (a screen without one is left dark and logged);
+  that the keymap's levels read as described on layouts other than `us` and
+  `de` (those two were drawn). Not done: the keyboard on the guest and
+  return screens; the session picker and the footer while it is open; key
+  repeat for Delete; sliding a finger from one key to another (a key types
+  when the finger goes down); a touch screen on a monitor other than the
+  primary (touch is mapped onto the primary); input devices plugged in after
+  start (libinput still lists `/dev/input` once);
 - stage 9 (above) is written and compile-checked, never run: no greeter
   was crashed on purpose, no lock-down item was seen working on either
   kernel, the services were not installed, and the Landlock path list was

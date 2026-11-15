@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use input::event::keyboard::{KeyState, KeyboardEventTrait};
 use input::event::pointer::{ButtonState, PointerEvent};
-use input::event::touch::{TouchEvent, TouchEventPosition};
+use input::event::touch::{TouchEvent, TouchEventPosition, TouchEventSlot};
 use input::event::{Event, KeyboardEvent};
 use input::{Libinput, LibinputInterface};
 use reclogin::log;
@@ -25,6 +25,7 @@ use xkbcommon::xkb;
 
 use crate::form::Key;
 use crate::link::Link;
+use crate::osk::Table;
 
 const WHO: &str = "reclogin-greeter";
 const BTN_LEFT: u32 = 0x110;
@@ -37,8 +38,20 @@ pub enum Happening {
     CapsLock(bool),
     /// The pointer moved to a spot (device pixels).
     Pointer(f32, f32),
-    /// A click or a touch at a spot.
+    /// A click at a spot.
     Press(f32, f32),
+    /// The button of a click was let go.
+    Release,
+    /// One finger on a touch screen: down, moved, up. The spot is in device
+    /// pixels of the primary screen; for `Up` it is where the finger was.
+    Touch(TouchPhase, f32, f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Down,
+    Move,
+    Up,
 }
 
 /// libinput's device opener: asks reclogind.
@@ -154,6 +167,17 @@ impl Keyboard {
     }
 }
 
+/// The keys of a layout for the on-screen keyboard, from a keymap compiled
+/// here (for `--render-png`, which has no input). The plain US keys when the
+/// layout does not compile.
+pub fn table_for(layout: Option<&Layout>) -> Table {
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    match Keyboard::keymap(&context, layout) {
+        Ok(keymap) => Table::from_keymap(&keymap),
+        Err(_) => Table::plain_us(),
+    }
+}
+
 struct Repeat {
     code: u32,
     key: Key,
@@ -166,6 +190,12 @@ pub struct Input {
     size: (f32, f32),
     pointer: (f32, f32),
     repeat: Option<Repeat>,
+    /// The finger being followed (the first one down); others are ignored
+    /// until it is lifted.
+    touch: Option<(u32, (f32, f32))>,
+    /// Counts layout changes, so the on-screen keyboard knows when to read
+    /// the keymap again.
+    layout_serial: u32,
 }
 
 impl Input {
@@ -201,7 +231,32 @@ impl Input {
             size,
             pointer: (size.0 / 2.0, size.1 / 2.0),
             repeat: None,
+            touch: None,
+            layout_serial: 0,
         })
+    }
+
+    /// The primary screen changed size: the pointer stays inside it, and
+    /// absolute devices map onto it.
+    pub fn set_size(&mut self, size: (u32, u32)) {
+        self.size = (size.0 as f32, size.1 as f32);
+        self.pointer.0 = self.pointer.0.clamp(0.0, self.size.0 - 1.0);
+        self.pointer.1 = self.pointer.1.clamp(0.0, self.size.1 - 1.0);
+    }
+
+    /// Forget a held key's repeat (the key woke the screen and is not typed).
+    pub fn cancel_repeat(&mut self) {
+        self.repeat = None;
+    }
+
+    /// Changes whenever the keyboard layout does.
+    pub fn layout_serial(&self) -> u32 {
+        self.layout_serial
+    }
+
+    /// What the keys of the current layout give, for the on-screen keyboard.
+    pub fn key_table(&self) -> Table {
+        Table::from_keymap(&self.keyboard.state.get_keymap())
     }
 
     pub fn fd(&self) -> RawFd {
@@ -210,12 +265,14 @@ impl Input {
 
     pub fn set_layout(&mut self, layout: &Layout) {
         self.keyboard.set_layout(layout);
+        self.layout_serial = self.layout_serial.wrapping_add(1);
     }
 
     /// The display left: let go of every device (reclogind has revoked them).
     pub fn suspend(&mut self) {
         self.libinput.suspend();
         self.repeat = None;
+        self.touch = None;
     }
 
     /// The display is back: open the devices again.
@@ -283,15 +340,48 @@ impl Input {
                     out.push(Happening::Pointer(self.pointer.0, self.pointer.1));
                 }
                 Event::Pointer(PointerEvent::Button(button)) => {
-                    if button.button() == BTN_LEFT && button.button_state() == ButtonState::Pressed
-                    {
-                        out.push(Happening::Press(self.pointer.0, self.pointer.1));
+                    if button.button() == BTN_LEFT {
+                        out.push(match button.button_state() {
+                            ButtonState::Pressed => {
+                                Happening::Press(self.pointer.0, self.pointer.1)
+                            }
+                            ButtonState::Released => Happening::Release,
+                        });
                     }
                 }
                 Event::Touch(TouchEvent::Down(down)) => {
-                    let x = down.x_transformed(self.size.0 as u32) as f32;
-                    let y = down.y_transformed(self.size.1 as u32) as f32;
-                    out.push(Happening::Press(x, y));
+                    if self.touch.is_none() {
+                        let x = down.x_transformed(self.size.0 as u32) as f32;
+                        let y = down.y_transformed(self.size.1 as u32) as f32;
+                        self.touch = Some((down.slot().unwrap_or(0), (x, y)));
+                        self.pointer = (x, y);
+                        out.push(Happening::Touch(TouchPhase::Down, x, y));
+                    }
+                }
+                Event::Touch(TouchEvent::Motion(motion)) => {
+                    if let Some((slot, at)) = &mut self.touch {
+                        if motion.slot().unwrap_or(0) == *slot {
+                            let x = motion.x_transformed(self.size.0 as u32) as f32;
+                            let y = motion.y_transformed(self.size.1 as u32) as f32;
+                            *at = (x, y);
+                            self.pointer = (x, y);
+                            out.push(Happening::Touch(TouchPhase::Move, x, y));
+                        }
+                    }
+                }
+                Event::Touch(TouchEvent::Up(up)) => {
+                    if let Some((slot, (x, y))) = self.touch {
+                        if up.slot().unwrap_or(0) == slot {
+                            self.touch = None;
+                            out.push(Happening::Touch(TouchPhase::Up, x, y));
+                        }
+                    }
+                }
+                Event::Touch(TouchEvent::Cancel(_)) => {
+                    // Every finger is off: what was under the finger is not pressed.
+                    if let Some((_, (x, y))) = self.touch.take() {
+                        out.push(Happening::Touch(TouchPhase::Up, x, y));
+                    }
                 }
                 _ => {}
             }

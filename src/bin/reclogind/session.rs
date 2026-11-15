@@ -23,7 +23,7 @@
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -34,7 +34,7 @@ use reclogin::wire::Channel;
 
 use crate::pam::{self, Pam};
 use crate::sessions::{WAYLAND_DIR, X11_DIR};
-use crate::worker::{next_signal, receive, Command, FromWorker, SessionRef, Talk};
+use crate::worker::{hold, next_signal, receive, Command, FromWorker, SessionRef, Talk};
 use crate::xserver;
 
 const WHO: &str = "reclogind (session worker)";
@@ -341,7 +341,11 @@ pub fn run(
         failed();
         return;
     }
+    // Opening and closing the PAM session must not be cut short
+    // (`reclogind` holds its kill timer meanwhile, `login.rs`).
+    hold(channel, true);
     let rc = pam.open_session();
+    hold(channel, false);
     if rc != pam::SUCCESS {
         log(
             WHO,
@@ -362,7 +366,9 @@ pub fn run(
     }
 
     let close = |pam: &mut Pam<Talk<'_>>| {
+        hold(channel, true);
         let rc = pam.close_session();
+        hold(channel, false);
         if rc != pam::SUCCESS {
             log(
                 WHO,
@@ -435,11 +441,19 @@ pub fn run(
         }
     }
 
-    // From here the greeter is gone: every end is `Ended`.
-    send(&FromWorker::ReadyToStart {
+    // From here the greeter is gone: every end is `Ended`. The X server's
+    // process descriptor goes with it: `reclogind` signals the server's
+    // process group only while that process lives.
+    let x_pidfd = x.as_ref().and_then(|x| x.pidfd());
+    let ready = FromWorker::ReadyToStart {
         console,
         x_server: x.as_ref().map(|x| x.pid()),
-    });
+        x_pidfd: x_pidfd.is_some(),
+    };
+    let handles: Vec<_> = x_pidfd.iter().map(|fd| fd.as_fd()).collect();
+    if let Err(e) = channel.send(&ready, &handles) {
+        log(WHO, format_args!("sending: {e}"));
+    }
     if !wait_until_shown(console, channel) {
         log(WHO, "cancelled before the session started");
         if let Some(x) = x.as_mut() {
@@ -475,10 +489,18 @@ pub fn run(
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, 0 as libc::c_ulong, 0, 0, 0);
     }
-    send(&FromWorker::Started {
+    // Our child, not reaped: the number is still the desktop's process.
+    let desktop_pidfd = pidfd_open(pid);
+    let started = FromWorker::Started {
         console,
         desktop: pid,
-    });
+        pidfd: desktop_pidfd.is_some(),
+    };
+    let handles: Vec<_> = desktop_pidfd.iter().map(|fd| fd.as_fd()).collect();
+    if let Err(e) = channel.send(&started, &handles) {
+        log(WHO, format_args!("sending: {e}"));
+    }
+    drop(desktop_pidfd);
 
     let status = match x.as_mut() {
         Some(x) => x.wait_for_end(pid, channel, signals),
@@ -508,6 +530,9 @@ struct Prepared {
     /// Whether the console becomes the process's controlling terminal: not
     /// in an X session, whose X server has it already.
     controlling_tty: bool,
+    /// The guest's session makes no set-id file (`nosetid.rs`): installed
+    /// in the child just before `exec`.
+    filter: Option<crate::nosetid::Filter>,
 }
 
 impl Prepared {
@@ -602,6 +627,7 @@ impl Prepared {
             log_dirs,
             log_file,
             controlling_tty: plan.kind != SessionKind::X11,
+            filter: (account.uid == crate::guest::UID).then(crate::nosetid::Filter::new),
         })
     }
 
@@ -677,6 +703,11 @@ impl Prepared {
             }
             if libc::chdir(self.home.as_ptr()) != 0 {
                 libc::chdir(c"/".as_ptr());
+            }
+            if let Some(filter) = &self.filter {
+                if filter.install().is_err() {
+                    libc::_exit(126);
+                }
             }
             libc::execve(self.shell.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(127);
@@ -840,8 +871,26 @@ pub(crate) fn end(pid: libc::pid_t) -> i32 {
     }
 }
 
+/// A process descriptor for `pid` (`pidfd_open`, Linux 5.3), close-on-exec.
+/// Only for a child not yet reaped, whose number cannot have been reused.
+pub(crate) fn pidfd_open(pid: libc::pid_t) -> Option<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        log(
+            WHO,
+            format_args!(
+                "no process descriptor for {pid}: {}",
+                io::Error::last_os_error()
+            ),
+        );
+        return None;
+    }
+    // pidfd_open sets close-on-exec itself.
+    Some(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
 /// Whether a `cancel` (or the loss of `reclogind`) is waiting on `channel`.
-fn cancel_waiting(channel: &Channel) -> bool {
+pub(crate) fn cancel_waiting(channel: &Channel) -> bool {
     while let Ok(true) = channel.wait_readable(0) {
         match receive(channel) {
             Ok(Some(Command::Cancel)) | Ok(None) | Err(_) => return true,

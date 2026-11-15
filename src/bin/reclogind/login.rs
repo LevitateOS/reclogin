@@ -7,8 +7,11 @@
 //! session is open the worker says `ready_to_start`, and `reclogind` lets the
 //! greeter go, gives the display up and shows that console, and checks that
 //! it is shown. While the session runs no greeter runs. When the worker has
-//! exited, `reclogind` shows the login console again and starts a fresh
-//! greeter.
+//! exited, `reclogind` starts a fresh greeter and shows the login console,
+//! but only to someone still on the ended session's console (or on no
+//! session); anyone who moved to another session stays there. A worker
+//! that has not exited a minute after its desktop ended is ended, and the
+//! login console never stays shown without a greeter starting on it.
 //!
 //! A worker is never killed to make room: `cancel` asks it to end, it
 //! closes what it opened (PAM session, credentials, console) and exits, and
@@ -18,14 +21,30 @@
 //! its desktop runs leaves the desktop to `reclogind`, which ends it (its
 //! process group, and the X server's) before the login screen comes back.
 //! Every `begin` gets exactly one `auth_result`; a `cancel` that ends a
-//! login gets it when the worker is gone.
+//! login gets it when the worker is gone, and so does an attempt whose
+//! worker ended before the greeter was let go without saying `failed`.
+//!
+//! A worker announces the steps that must not be cut short (`hold`: the
+//! guest's cleanup and home, opening and closing the PAM session); while it
+//! is in one, neither the fifteen seconds after a cancel nor the minute
+//! after its desktop ended lead to a kill, for up to two minutes.
+//!
+//! The X server's and the desktop's process groups are signalled by
+//! `reclogind` only while their leader lives, which it checks through the
+//! process descriptors the worker sends with `ready_to_start` and `started`
+//! (a number alone could have been given to another process after the
+//! worker reaped them). When a leader is gone, the rest of its group (the
+//! desktop's or X server's own children that stayed in it) is left to the
+//! login service: on LevitateOS logind ends the session's scope only with
+//! `KillUserProcesses`, so such processes may run on until they end by
+//! themselves; a guest's are ended by the guest's cleanup in any case.
 //!
 //! How the greeter itself is started, restarted and given up on belongs to
 //! [`crate::supervise`]; this module only calls it.
 
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -54,6 +73,13 @@ const DESKTOP_END: Duration = Duration::from_secs(10);
 const SHOW_WITHIN: Duration = Duration::from_secs(5);
 /// No new worker this soon after a failed or cancelled attempt.
 const FAILURE_PAUSE: Duration = Duration::from_secs(1);
+/// How long a worker whose desktop has ended has to close and exit.
+const CLOSE_WITHIN: Duration = Duration::from_secs(60);
+/// How long a step the worker announced as not to be cut short (`hold`)
+/// keeps it from being killed.
+const HOLD_MOST: Duration = Duration::from_secs(120);
+/// How often a running session's desktop is looked at (has it ended?).
+const DESKTOP_LOOK_MS: libc::c_int = 2000;
 const KDGETMODE: libc::c_ulong = 0x4B3B;
 const KDSETMODE: libc::c_ulong = 0x4B3A;
 
@@ -84,9 +110,23 @@ pub struct Login {
     orphans: Vec<Orphan>,
     /// A line for the next greeter's screen, sent once it has its state.
     notice: Option<String>,
+    /// The console of the session that ended last, until the login screen
+    /// came back: only from that console is the display taken (`console.rs`,
+    /// `Daemon::login_console_wanted`).
+    ended_console: Option<u32>,
     /// Whether `begin {who: guest}` may start a guest, set at start
     /// (`guest::at_start`); refused until then.
     pub(crate) guest: guest::Setting,
+    /// The guest's cleanup child (`guest.rs`).
+    pub(crate) cleaner: guest::Cleaner,
+}
+
+/// How a login was started: the person asked (`begin`), or `reclogind`'s
+/// start-up did (`autologin.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Entry {
+    Typed,
+    Automatic,
 }
 
 struct Worker {
@@ -99,6 +139,8 @@ struct Worker {
     /// Who and what, for `last.rs` once the session has started.
     user: String,
     session: String,
+    /// Whether the person began it or the start-up did.
+    entry: Entry,
     /// A guest login (`guest.rs`): never remembered in `last.rs`; its
     /// cleanup is run again here when the worker did not finish it.
     guest: bool,
@@ -108,8 +150,14 @@ struct Worker {
     /// is not passed on.
     cancelled: bool,
     /// The greeter's `cancel` ended this login: it gets its `auth_result`
-    /// when the worker is gone.
+    /// (with no text) when the worker is gone.
     owe_answer: bool,
+    /// This attempt's `auth_result` was sent (a failure, the greeter let
+    /// go, a refusal). One not sent when the worker is gone is sent then.
+    answered: bool,
+    /// Since when the worker is in a step it announced as not to be cut
+    /// short (`hold`).
+    hold_since: Option<Instant>,
     /// PAM accepted the person: the console may have been handed over.
     accepted: bool,
     /// When it was asked to end; killed `END_WAIT` later.
@@ -119,10 +167,13 @@ struct Worker {
     /// replaced greeter cannot answer its questions.
     generation: u64,
     /// Process groups to end if the worker goes away without closing them.
-    x_server: Option<libc::pid_t>,
-    desktop: Option<libc::pid_t>,
+    x_server: Option<Group>,
+    desktop: Option<Group>,
     /// By when the session's console must be shown (after `ready_to_start`).
     show_by: Option<Instant>,
+    /// Since when its desktop is known to have ended (or it said `failed`
+    /// or `ended`): it has `CLOSE_WITHIN` to exit.
+    closing_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,9 +189,55 @@ enum Phase {
     Done,
 }
 
+/// A process group the worker started (the X server's, the desktop's): its
+/// number and its leader's process descriptor.
+struct Group {
+    pgid: libc::pid_t,
+    leader: Option<OwnedFd>,
+}
+
+impl Group {
+    fn new(pgid: libc::pid_t, handles: &mut Vec<OwnedFd>, sent: bool) -> Group {
+        Group {
+            pgid,
+            leader: if sent { handles.pop() } else { None },
+        }
+    }
+
+    /// Whether the leader still exists (a zombie counts: its number is not
+    /// free yet), asked through its process descriptor
+    /// (`pidfd_send_signal` with signal 0). Without a descriptor: unknown,
+    /// so no.
+    fn leader_alive(&self) -> bool {
+        let Some(fd) = &self.leader else {
+            return false;
+        };
+        self.pgid > 1
+            && unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    0,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            } == 0
+    }
+
+    /// Signal the whole group, only while its leader lives: then its number
+    /// cannot belong to anyone else.
+    fn signal(&self, signal: libc::c_int) {
+        if self.leader_alive() {
+            unsafe {
+                libc::kill(-self.pgid, signal);
+            }
+        }
+    }
+}
+
 /// Process groups of a session whose worker went away, being ended.
 struct Orphan {
-    groups: Vec<libc::pid_t>,
+    groups: Vec<Group>,
     console: u32,
     since: Instant,
     killed: bool,
@@ -178,8 +275,20 @@ impl Login {
     pub fn wants_tick(&self) -> bool {
         !self.orphans.is_empty()
             || self.worker.as_ref().is_some_and(|w| {
-                w.ending_since.is_some() || w.show_by.is_some() || w.channel.is_none()
+                w.ending_since.is_some()
+                    || w.show_by.is_some()
+                    || w.channel.is_none()
+                    || w.closing_since.is_some()
             })
+    }
+
+    /// While a session runs: how soon its desktop is looked at again, so
+    /// that a worker that hangs after it ended is noticed.
+    pub fn wait_ms(&self) -> Option<libc::c_int> {
+        self.worker
+            .as_ref()
+            .is_some_and(|w| w.phase == Phase::Running)
+            .then_some(DESKTOP_LOOK_MS)
     }
 
     /// The console of the session being started or running.
@@ -235,30 +344,36 @@ impl Worker {
         !matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Its desktop's and X server's process groups that still exist.
-    fn groups_left(&self) -> Vec<libc::pid_t> {
-        [self.desktop, self.x_server]
+    /// Its desktop's and X server's process groups whose leader still
+    /// lives.
+    fn take_groups_left(&mut self) -> Vec<Group> {
+        [self.desktop.take(), self.x_server.take()]
             .into_iter()
             .flatten()
-            .filter(|&g| group_exists(g))
+            .filter(Group::leader_alive)
             .collect()
+    }
+
+    /// Whether its desktop has ended: through the process descriptor when
+    /// there is one, else by number (only to decide when to wait less).
+    fn desktop_ended(&self) -> bool {
+        self.desktop.as_ref().is_some_and(|g| match g.leader {
+            Some(_) => !g.leader_alive(),
+            None => !process_exists(g.pgid),
+        })
     }
 }
 
-/// Whether process group `group` still has a process.
-fn group_exists(group: libc::pid_t) -> bool {
-    group > 1
-        && (unsafe { libc::kill(-group, 0) } == 0
+/// Whether process `pid` still exists.
+fn process_exists(pid: libc::pid_t) -> bool {
+    pid > 1
+        && (unsafe { libc::kill(pid, 0) } == 0
             || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
 }
 
-fn signal_groups(groups: &[libc::pid_t], signal: libc::c_int) {
-    for &group in groups {
-        if group > 1 {
-            unsafe {
-                libc::kill(-group, signal);
-            }
-        }
+fn signal_groups(groups: &[Group], signal: libc::c_int) {
+    for group in groups {
+        group.signal(signal);
     }
 }
 
@@ -467,7 +582,7 @@ impl Daemon {
         }
     }
 
-    fn refuse(&mut self, text: &str) -> Next {
+    pub(crate) fn refuse(&mut self, text: &str) -> Next {
         self.send(&ToGreeter::AuthResult {
             ok: false,
             text: text.into(),
@@ -522,21 +637,44 @@ impl Daemon {
                     log(WHO, format_args!("guest refused ({:?})", self.login.guest));
                     return self.refuse(text);
                 }
+                // A cleanup runs or failed (the screen should not have
+                // offered Guest then).
+                if let Some(text) = guest::not_ready() {
+                    log(
+                        WHO,
+                        "guest refused: the guest's cleanup has not finished clean",
+                    );
+                    return self.refuse(text);
+                }
                 (guest::NAME.to_string(), true)
             }
         };
+        self.start_login(user, guest, Entry::Typed, None)
+    }
+
+    /// The rest of a login once it is known who: the session (`wanted`, else
+    /// the one the greeter chose, else the first installed), a console and
+    /// a worker. Every refusal is answered to the greeter.
+    pub(crate) fn start_login(
+        &mut self,
+        user: String,
+        guest: bool,
+        entry: Entry,
+        wanted: Option<String>,
+    ) -> Next {
         let installed = sessions::installed(
             Path::new(sessions::WAYLAND_DIR),
             Path::new(sessions::X11_DIR),
         );
-        let session = match &self.login.chosen {
+        let id = wanted.or_else(|| self.login.chosen.clone());
+        let session = match &id {
             Some(id) => match installed.iter().find(|s| &s.id == id) {
                 Some(s) => s,
-                None => return self.refuse(SESSION_GONE),
+                None => return self.refuse(&entry.line(SESSION_GONE)),
             },
             None => match installed.first() {
                 Some(s) => s,
-                None => return self.refuse(NO_SESSION),
+                None => return self.refuse(&entry.line(NO_SESSION)),
             },
         };
         let session = SessionRef {
@@ -548,14 +686,14 @@ impl Daemon {
             Ok(number) => number,
             Err(e) => {
                 log(WHO, format_args!("finding a console for the session: {e}"));
-                return self.refuse(NO_CONSOLE);
+                return self.refuse(&entry.line(NO_CONSOLE));
             }
         };
         let (child, channel) = match spawn_worker() {
             Ok(pair) => pair,
             Err(e) => {
                 log(WHO, format_args!("starting the session worker: {e}"));
-                return self.refuse(BROKEN);
+                return self.refuse(&entry.line(BROKEN));
             }
         };
         let mut w = Worker {
@@ -565,10 +703,13 @@ impl Daemon {
             console,
             user: user.clone(),
             session: session.id.clone(),
+            entry,
             guest,
             prompt: None,
             cancelled: false,
             owe_answer: false,
+            answered: false,
+            hold_since: None,
             accepted: false,
             ending_since: None,
             killed: false,
@@ -576,9 +717,22 @@ impl Daemon {
             x_server: None,
             desktop: None,
             show_by: None,
+            closing_since: None,
         };
         if guest {
-            w.send(&ToWorker::StartGuest { session, console });
+            // The automatic login at start comes while the start's cleanup
+            // runs: it waits for it.
+            w.send(&ToWorker::StartGuest {
+                session,
+                console,
+                wait: entry == Entry::Automatic,
+            });
+        } else if entry == Entry::Automatic {
+            w.send(&ToWorker::StartAuto {
+                user,
+                session,
+                console,
+            });
         } else {
             w.send(&ToWorker::Start {
                 user,
@@ -599,7 +753,7 @@ impl Daemon {
             return Next::Continue;
         };
         match channel.recv::<FromWorker>() {
-            Ok(Some((message, _))) => self.on_worker_message(message),
+            Ok(Some((message, handles))) => self.on_worker_message(message, handles),
             Ok(None) => {
                 // It is exiting: the rest happens when it has (`login_reap`).
                 w.channel = None;
@@ -614,16 +768,31 @@ impl Daemon {
         }
     }
 
-    fn on_worker_message(&mut self, message: FromWorker) -> Next {
+    fn on_worker_message(&mut self, message: FromWorker, mut handles: Vec<OwnedFd>) -> Next {
         let Some(w) = self.login.worker.as_mut() else {
             return Next::Continue;
         };
+        if let FromWorker::Hold { on } = message {
+            if on {
+                w.hold_since.get_or_insert_with(Instant::now);
+            } else if w.hold_since.take().is_some() && w.ending_since.is_some() {
+                // Out of the step: the usual time to end begins now.
+                w.ending_since = Some(Instant::now());
+            }
+            return Next::Continue;
+        }
         if w.cancelled {
             // Not passed on; only what is needed to clean up after it.
             match message {
                 FromWorker::Accepted => w.accepted = true,
-                FromWorker::ReadyToStart { x_server, .. } => w.x_server = x_server,
-                FromWorker::Started { desktop, .. } => w.desktop = Some(desktop),
+                FromWorker::ReadyToStart {
+                    x_server, x_pidfd, ..
+                } => {
+                    w.x_server = x_server.map(|g| Group::new(g, &mut handles, x_pidfd));
+                }
+                FromWorker::Started { desktop, pidfd, .. } => {
+                    w.desktop = Some(Group::new(desktop, &mut handles, pidfd));
+                }
                 FromWorker::Failed { .. } | FromWorker::Ended { .. } => w.phase = Phase::Done,
                 _ => {}
             }
@@ -644,6 +813,8 @@ impl Daemon {
             FromWorker::Message { kind, text } => self.send(&ToGreeter::Message { kind, text }),
             FromWorker::Failed { text } => {
                 w.phase = Phase::Done;
+                w.answered = true;
+                let text = w.entry.line(&text);
                 self.login.last_failure = Some(Instant::now());
                 self.send(&ToGreeter::AuthResult { ok: false, text })
             }
@@ -654,8 +825,13 @@ impl Daemon {
                 }
                 Next::Continue
             }
-            FromWorker::ReadyToStart { console, x_server } => {
-                w.x_server = x_server;
+            FromWorker::ReadyToStart {
+                console,
+                x_server,
+                x_pidfd,
+            } => {
+                w.x_server = x_server.map(|g| Group::new(g, &mut handles, x_pidfd));
+                w.answered = true;
                 if w.phase != Phase::Opening || console != w.console {
                     log(
                         WHO,
@@ -675,8 +851,12 @@ impl Daemon {
                 }
                 Next::Continue
             }
-            FromWorker::Started { console, desktop } => {
-                w.desktop = Some(desktop);
+            FromWorker::Started {
+                console,
+                desktop,
+                pidfd,
+            } => {
+                w.desktop = Some(Group::new(desktop, &mut handles, pidfd));
                 if w.phase == Phase::Starting && console == w.console {
                     w.phase = Phase::Running;
                     w.show_by = None;
@@ -697,6 +877,7 @@ impl Daemon {
                 w.phase = Phase::Done;
                 Next::Continue
             }
+            FromWorker::Hold { .. } => Next::Continue,
         }
     }
 
@@ -720,6 +901,10 @@ impl Daemon {
     /// On `SIGCHLD`, a closed worker socket, and each timed turn: if the
     /// worker has exited, finish with it.
     pub(crate) fn login_reap(&mut self) -> Next {
+        // The guest's cleanup child, if one ended (`guest.rs`).
+        if let Next::Stop = self.reap_guest_cleanup() {
+            return Next::Stop;
+        }
         let exited = self.login.worker.as_mut().is_some_and(Worker::exited);
         if !exited {
             return Next::Continue;
@@ -728,16 +913,22 @@ impl Daemon {
         self.worker_exited(w)
     }
 
-    fn worker_exited(&mut self, w: Worker) -> Next {
+    fn worker_exited(&mut self, mut w: Worker) -> Next {
         let clean = w.phase == Phase::Done && !w.killed;
-        // A guest worker cleans up after its session itself; one that went
-        // away first, or whose cleanup did not finish, leaves it to a thread
-        // here (`guest.rs`), which waits for nothing of the screen.
-        if w.guest && (!clean || guest::cleanup_failed()) {
-            guest::cleanup_in_background();
+        if self.login.greeter_away {
+            self.login.ended_console = Some(w.console);
+        }
+        // Answers owed to a greeter that was replaced meanwhile are dropped.
+        let same_greeter = w.generation == self.supervisor.generation;
+        // After every guest worker, however it ended (killed too), the
+        // cleanup child runs, with the login service's `TerminateUser`, which
+        // the worker must not ask for itself (`guest.rs`); Guest is not
+        // offered until it finished clean.
+        if w.guest {
+            self.start_guest_cleanup("after the guest's worker");
         }
         if !clean {
-            let left = w.groups_left();
+            let left = w.take_groups_left();
             if !left.is_empty() {
                 // Its desktop runs on, unlocked, on another console: end it
                 // before the login screen comes back.
@@ -762,18 +953,17 @@ impl Daemon {
         if w.cancelled || !clean {
             self.login.last_failure = Some(Instant::now());
         }
-        if w.owe_answer && !self.login.greeter_away {
-            if let Next::Stop = self.send(&ToGreeter::AuthResult {
-                ok: false,
-                text: String::new(),
-            }) {
+        // Exactly one `auth_result` per attempt: one not yet sent goes now,
+        // empty after the greeter's own cancel, else why it did not work.
+        if !w.answered && !self.login.greeter_away && same_greeter {
+            let text = if w.owe_answer {
+                String::new()
+            } else {
+                log(WHO, "the session worker ended in the middle of a login");
+                w.entry.line(BROKEN)
+            };
+            if let Next::Stop = self.send(&ToGreeter::AuthResult { ok: false, text }) {
                 return Next::Stop;
-            }
-        }
-        if !w.cancelled && !clean && matches!(w.phase, Phase::Asking | Phase::Opening) {
-            log(WHO, "the session worker ended in the middle of a login");
-            if !self.login.greeter_away {
-                return self.refuse(BROKEN);
             }
         }
         self.maybe_return_to_login()
@@ -798,16 +988,18 @@ impl Daemon {
         }
         self.login.greeter_away = false;
         self.login.chosen = None;
+        let ended = self.login.ended_console.take();
         // The session that just ended must not be marked on the new screen:
         // the login service is asked again (the answer reaches the greeter
         // as a new state).
         self.logind.refresh();
-        let shown_now = matches!(vt_state(), Ok(s) if u32::from(s.v_active) == self.console.number);
+        let mut shown_now =
+            matches!(vt_state(), Ok(s) if u32::from(s.v_active) == self.console.number);
         if shown_now {
-            self.shown = true;
-            if let Err(e) = self.display.take() {
-                log(WHO, format_args!("taking the display back: {e}"));
-            }
+            // Reopened once on failure, and checked to be still shown
+            // (`console.rs`).
+            shown_now = self.take_display_for_greeter().is_some();
+            self.shown = shown_now;
         }
         match self.supervisor.launch_until_up(&self.display, self.shown) {
             Ok(fresh) => self.greeter = fresh,
@@ -818,9 +1010,20 @@ impl Daemon {
                 return Next::Stop;
             }
         }
+        // Only a person still on the ended session's console (or on no
+        // session at all) is brought to the login screen; anyone who moved
+        // to another session stays, and the greeter takes over when the
+        // login console is next shown.
         if !shown_now {
-            if let Err(e) = self.console.switch_to(self.console.number) {
-                log(WHO, format_args!("showing the login console: {e}"));
+            if self.login_console_wanted(ended) {
+                if let Err(e) = self.console.switch_to(self.console.number) {
+                    log(WHO, format_args!("showing the login console: {e}"));
+                }
+            } else {
+                log(
+                    WHO,
+                    "another session is shown; the login screen waits until its console is",
+                );
             }
         }
         Next::Continue
@@ -844,7 +1047,16 @@ impl Daemon {
         if !self.login.greeter_away {
             return None;
         }
-        let console = self.login.session_console()?;
+        // No session starting or running, yet no greeter: the last one is
+        // still closing (or its worker hangs). The login console never stays
+        // shown with nobody on it: a greeter starts now.
+        let Some(console) = self.login.session_console() else {
+            log(
+                WHO,
+                "the login console is shown while the last session is still closing; starting the login screen",
+            );
+            return Some(self.return_to_login());
+        };
         if let Err(e) = self.console.switch_to(console) {
             log(WHO, format_args!("showing console {console} again: {e}"));
         }
@@ -877,14 +1089,46 @@ impl Daemon {
     pub(crate) fn login_tick(&mut self) -> Next {
         let now = Instant::now();
         if let Some(w) = self.login.worker.as_mut() {
+            // A worker whose desktop ended has a minute to close; then it is
+            // asked to end and killed at once by the step below (which is
+            // where a step that must not be cut short is respected).
+            if w.closing_since.is_none()
+                && (w.phase == Phase::Done || (w.phase == Phase::Running && w.desktop_ended()))
+            {
+                w.closing_since = Some(now);
+            }
+            if let Some(since) = w.closing_since {
+                if w.ending_since.is_none()
+                    && !w.killed
+                    && now.duration_since(since) >= CLOSE_WITHIN
+                {
+                    log(
+                        WHO,
+                        format_args!(
+                            "THE SESSION WORKER (pid {}) DID NOT EXIT WITHIN {} SECONDS OF ITS DESKTOP ENDING; ENDING IT. Its PAM session may not be closed.",
+                            w.child.id(),
+                            CLOSE_WITHIN.as_secs()
+                        ),
+                    );
+                    w.cancel();
+                    w.ending_since = now.checked_sub(END_WAIT);
+                }
+            }
+            // The kill step, for both timers above. A step the worker
+            // announced as not to be cut short (`hold`) holds it off, for up
+            // to `HOLD_MOST`; after the step it gets `END_WAIT` again.
             if let Some(since) = w.ending_since {
-                if !w.killed && now.duration_since(since) >= END_WAIT {
+                let due = match w.hold_since {
+                    Some(held) => now.duration_since(held) >= HOLD_MOST,
+                    None => now.duration_since(since) >= END_WAIT,
+                };
+                if !w.killed && due {
                     log(
                         WHO,
                         format_args!(
                             "THE SESSION WORKER (pid {}) DID NOT END WITHIN {} SECONDS OF BEING ASKED; KILLING IT. Its PAM session may not be closed.",
                             w.child.id(),
-                            END_WAIT.as_secs()
+                            if w.hold_since.is_some() { HOLD_MOST } else { END_WAIT }.as_secs()
                         ),
                     );
                     let _ = w.child.kill();
@@ -912,15 +1156,31 @@ impl Daemon {
         if let Next::Stop = self.login_reap() {
             return Next::Stop;
         }
+        // The login console shown, no greeter, and no session starting (a
+        // session's console that never came, a worker still closing): a
+        // greeter starts now, whatever the worker is doing.
+        if self.login.greeter_away
+            && self.login.session_console().is_none()
+            && matches!(vt_state(), Ok(s) if u32::from(s.v_active) == self.console.number)
+        {
+            log(
+                WHO,
+                "the login console is shown with nobody on it; starting the login screen",
+            );
+            return self.return_to_login();
+        }
 
         let mut finished = false;
         let mut i = 0;
         while i < self.login.orphans.len() {
             let orphan = &mut self.login.orphans[i];
-            orphan.groups.retain(|&g| group_exists(g));
+            orphan.groups.retain(Group::leader_alive);
             if orphan.groups.is_empty() {
                 let console = orphan.console;
                 self.login.orphans.remove(i);
+                if self.login.greeter_away {
+                    self.login.ended_console = Some(console);
+                }
                 log(
                     WHO,
                     format_args!("the session on console {console} has ended"),
@@ -990,7 +1250,7 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(50));
         }
         if w.killed || w.phase != Phase::Done {
-            let left = w.groups_left();
+            let left = w.take_groups_left();
             signal_groups(&left, libc::SIGKILL);
             if w.accepted || w.killed {
                 reset_console(w.console);

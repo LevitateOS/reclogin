@@ -1,62 +1,73 @@
 // Installed as /usr/share/polkit-1/rules.d/50-reclogin-guest.rules (both OSes).
 // docs/reclogin-guest.md, point 1, "What the guest may and may not do", and
 // the owner's decisions 3 (no new WiFi) and 4 (USB drives: mount, unmount,
-// eject only). A deny list (risk R8): an action not named here keeps its
-// own default.
+// eject only).
+//
+// An allow list. For a subject whose user is `guest`, the actions below are
+// allowed while the guest's session is local and the one in front; every
+// other action, and these from a session that is not in front, is refused.
+// polkit never falls back to its default for the guest, so no administrator
+// password (and no password at all) is ever asked for inside a guest session:
+// the guest controls every program there, and a password typed in would be
+// given away. There is no addAdminRule: nothing reaches the admin step.
+//
+// Each allowed action is on its own line with the design point it comes from.
+// Things the design allows that need no polkit action are not listed:
+// printing (CUPS lets any local user print), sound and camera and scanner
+// (device access for the active session through uaccess), unmounting a drive
+// one mounted oneself (udisks2 needs no action for that), installing "for me"
+// with Recipe (no rights needed).
 
-// No administrator is ever asked for inside a guest session: the guest
-// controls every program there, so a password typed in would be given away.
-// (Whether an empty list makes polkit refuse rather than fall back is to be
-// confirmed against polkit's documentation; the deny list holds either way.)
-polkit.addAdminRule(function (action, subject) {
-    if (subject.user == "guest") {
-        return [];
-    }
-});
+var RECLOGIN_GUEST_ALLOWED = {
+    // Removable drives (decision 4; point 1 "Removable drives").
+    "org.freedesktop.udisks2.filesystem-mount": true,       // mount a removable drive
+    "org.freedesktop.udisks2.eject-media": true,            // eject it
+    "org.freedesktop.udisks2.power-off-drive": true,        // power it off before unplugging
+
+    // Existing network connections only (decision 3; point 1 "Network").
+    "org.freedesktop.NetworkManager.network-control": true, // switch existing connections on and off
+    "org.freedesktop.NetworkManager.wifi.scan": true,       // see which known networks are near
+
+    // Sound (point 1 "Sound ... while its session is the active one"):
+    // real-time scheduling for the sound server.
+    "org.freedesktop.RealtimeKit1.acquire-high-priority": true,
+    "org.freedesktop.RealtimeKit1.acquire-real-time": true,
+
+    // Printing to configured printers (point 1 "Printing"): the guest's own
+    // jobs only; adding or changing printers stays refused.
+    "org.opensuse.cupspkhelper.mechanism.job-cancel": true,
+    "org.opensuse.cupspkhelper.mechanism.job-edit": true,
+
+    // Shut down, restart, suspend "as any user" (point 1), when nobody else
+    // is logged in; the "-multiple-sessions" and "-ignore-inhibit" forms,
+    // which ask for an administrator for anyone, stay refused.
+    "org.freedesktop.login1.power-off": true,
+    "org.freedesktop.login1.reboot": true,
+    "org.freedesktop.login1.suspend": true,
+
+    // What a desktop takes for itself to do the above well (point 1
+    // "Shut down, restart, suspend"): delaying sleep and shutdown, handling
+    // the power keys and the lid itself, keeping the screen awake.
+    "org.freedesktop.login1.inhibit-block-idle": true,
+    "org.freedesktop.login1.inhibit-delay-sleep": true,
+    "org.freedesktop.login1.inhibit-delay-shutdown": true,
+    "org.freedesktop.login1.inhibit-handle-power-key": true,
+    "org.freedesktop.login1.inhibit-handle-suspend-key": true,
+    "org.freedesktop.login1.inhibit-handle-hibernate-key": true,
+    "org.freedesktop.login1.inhibit-handle-reboot-key": true,
+    "org.freedesktop.login1.inhibit-handle-lid-switch": true,
+
+    // "Switch user" to hand the machine back (point 5): showing another
+    // console.
+    "org.freedesktop.login1.chvt": true
+};
 
 polkit.addRule(function (action, subject) {
     if (subject.user != "guest") {
         return;
     }
-    var id = action.id;
-    var startsWith = function (prefix) {
-        return id.indexOf(prefix) == 0;
-    };
-
-    // Removable drives: mounting, ejecting, powering off a drive keep udisks2's
-    // own defaults for the active session (unmounting one's own mount needs no
-    // action). Everything else of udisks2 is refused.
-    if (startsWith("org.freedesktop.udisks2.")) {
-        if (id == "org.freedesktop.udisks2.filesystem-mount" ||
-            id == "org.freedesktop.udisks2.eject-media" ||
-            id == "org.freedesktop.udisks2.power-off-drive") {
-            return;
-        }
-        return polkit.Result.NO;
+    if (RECLOGIN_GUEST_ALLOWED[action.id] === true && subject.local && subject.active) {
+        return polkit.Result.YES;
     }
-
-    // Existing network connections only: no new or changed connection.
-    if (startsWith("org.freedesktop.NetworkManager.settings.modify.")) {
-        return polkit.Result.NO;
-    }
-
-    // Nothing kept running after logout.
-    if (id == "org.freedesktop.login1.set-self-linger" ||
-        id == "org.freedesktop.login1.set-user-linger") {
-        return polkit.Result.NO;
-    }
-
-    // Users, time, language, host name, firmware.
-    if (startsWith("org.freedesktop.accounts.") ||
-        startsWith("org.freedesktop.timedate1.") ||
-        startsWith("org.freedesktop.locale1.") ||
-        startsWith("org.freedesktop.hostname1.") ||
-        startsWith("org.freedesktop.fwupd.")) {
-        return polkit.Result.NO;
-    }
-
-    // The system tools' helpers: Recipe's system scope, recab, the updater.
-    if (startsWith("org.levitateos.")) {
-        return polkit.Result.NO;
-    }
+    return polkit.Result.NO;
 });

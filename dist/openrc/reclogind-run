@@ -6,21 +6,47 @@
 # request. A reclogind that dies by itself (SIGKILL, a crash the last resort
 # could not catch) would leave console 7 in graphics mode with its keyboard
 # off. This wrapper runs reclogind, passes SIGTERM, SIGINT and SIGHUP on to
-# it, and after it has ended, for whatever reason, gives console 7 back
+# it (also one that comes while reclogind is being started), and after it
+# has ended, for whatever reason, gives console 7 back
 # (`reclogind --reset-console 7` does nothing when reclogind already did)
 # and exits with reclogind's status, so that status 3 (gave up) still shows.
 
 RECLOGIND=/usr/bin/reclogind
 PIDFILE=/run/reclogin/reclogind.pid
 
+# The traps first: a signal that comes while reclogind is being started is
+# remembered and passed on as soon as its pid is known.
+pid=
+pending=
+pass_on() {
+	if [ -n "$pid" ]; then
+		kill -"$1" "$pid" 2>/dev/null
+	else
+		pending=$1
+	fi
+}
+trap 'pass_on TERM' TERM
+trap 'pass_on INT' INT
+trap 'pass_on HUP' HUP
+
+# Field 22 of /proc/PID/stat (the start time), read after the name in
+# parentheses, which may hold spaces.
+start_time() {
+	stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	rest=${stat##*) }
+	# shellcheck disable=SC2086
+	set -- $rest
+	echo "${20}"
+}
+
 "$RECLOGIND" "$@" &
 pid=$!
 mkdir -p /run/reclogin
-echo "$pid" > "$PIDFILE"
-
-trap 'kill -TERM "$pid" 2>/dev/null' TERM
-trap 'kill -INT "$pid" 2>/dev/null' INT
-trap 'kill -HUP "$pid" 2>/dev/null' HUP
+# The pid and its start time: stop_post kills only that very process.
+echo "$pid $(start_time "$pid")" > "$PIDFILE"
+if [ -n "$pending" ]; then
+	kill -"$pending" "$pid" 2>/dev/null
+fi
 
 # `wait` returns early (above 128) when a trapped signal arrives; wait again
 # while reclogind exists (a process that has exited but is not yet waited for

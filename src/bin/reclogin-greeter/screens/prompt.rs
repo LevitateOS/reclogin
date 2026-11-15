@@ -12,10 +12,11 @@ use super::login::{
     action_row, draw_lines, draw_list, footer, form_lines, header, header_height, line_heights,
     list_height, session_menu, Line, View, FOOTER_H, FORM_W, FORM_X, HEIGHT, TOP,
 };
-use super::Screen;
+use super::{Screen, Target};
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use reclogin::protocol::RunningSession;
 
+use crate::form::guest_running;
 use crate::paint::text::{Face, Style};
 use crate::paint::Painter;
 
@@ -36,7 +37,21 @@ pub fn draw(p: &mut Painter, v: &View) {
                 .to_string()
         })
         .unwrap_or_default();
+    // The guest screen while a guest session runs: back to it, or end it.
+    let guest_back = screen == Screen::Guest && guest_running(v.state);
     let (head, tail, texts, button): (&str, String, Vec<(String, bool)>, String) = match screen {
+        Screen::Guest if guest_back => (
+            "Back to ",
+            "the guest session.".into(),
+            vec![
+                (
+                    "A guest session is already running on this computer.".into(),
+                    false,
+                ),
+                ("Nothing in it is kept after it ends.".into(), true),
+            ],
+            "RETURN TO THE GUEST SESSION".into(),
+        ),
         Screen::Guest => (
             "Log in as ",
             "a guest.".into(),
@@ -104,11 +119,15 @@ pub fn draw(p: &mut Painter, v: &View) {
         })
         .collect();
     // "Session   Plasma (Wayland), running since 19:10", on the return screen.
-    let session_line = (screen == Screen::Return)
+    let session_line = (screen == Screen::Return || guest_back)
         .then(|| {
-            v.form
-                .chosen(v.state)
-                .and_then(|(_, u)| running_text(v, &u.name))
+            if guest_back {
+                running_text(v, "guest")
+            } else {
+                v.form
+                    .chosen(v.state)
+                    .and_then(|(_, u)| running_text(v, &u.name))
+            }
         })
         .flatten()
         .map(|text| {
@@ -128,7 +147,16 @@ pub fn draw(p: &mut Painter, v: &View) {
         .collect();
     let heights = line_heights(p, &lines);
     let lines_h: f32 = heights.iter().map(|h| 10.0 + h).sum();
-    let form_h = headline.height + 30.0 + texts_h + lines_h + 30.0 + 52.0;
+    // The quiet second button of a running guest session, under the first.
+    let end_guest = guest_back.then(|| {
+        p.lay(
+            &[("End the guest session", sans(15.0, pal.text_secondary))],
+            None,
+            false,
+        )
+    });
+    let end_h = end_guest.as_ref().map_or(0.0, |l| 24.0 + l.height + 6.0);
+    let form_h = headline.height + 30.0 + texts_h + lines_h + 30.0 + 52.0 + end_h;
 
     let grid_h = list_h.max(form_h);
     let gap = ((HEIGHT - header_h - grid_h - FOOTER_H) / 2.0).max(0.0);
@@ -161,6 +189,18 @@ pub fn draw(p: &mut Painter, v: &View) {
     let y = draw_lines(p, &lines, &heights, y);
 
     let menu = action_row(p, v, y + 30.0, &button);
+    if let Some(label) = &end_guest {
+        let top = y + 30.0 + 52.0 + 24.0;
+        p.put(label, FORM_X, top);
+        p.rule_h(FORM_X, top + label.height + 2.0, label.width, 1.0, pal.rule);
+        p.hit(
+            FORM_X,
+            top - 8.0,
+            label.width,
+            label.height + 16.0,
+            Target::EndGuest,
+        );
+    }
     footer(p, v);
     if let Some(menu) = menu {
         session_menu(p, v, menu);

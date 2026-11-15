@@ -11,19 +11,25 @@
 //!
 //! What it does:
 //!
-//! - Reads, and reports as a [`View`] whenever it changed: the sessions on
-//!   `seat0` of class `user`, and which of suspend, restart and power off
-//!   the service allows (`yes` only: `challenge`, `no` and `na` hide the
-//!   action). Hibernate is never asked.
-//! - Re-reads when the service signals (a thread follows every signal under
-//!   `/org/freedesktop/login1`: `SessionNew`, `SessionRemoved`, the sessions'
-//!   and seat's `PropertiesChanged`, `PrepareForSleep`, and wakes the main
-//!   loop; reads follow 150 ms after the last one, so a burst is one read),
-//!   on `refresh`, and every five seconds whatever happens.
+//! - Reads, and reports as a [`View`] whenever it changed: every session of
+//!   class `user`, on any seat or none (over the network, marked `remote`),
+//!   and which of suspend, restart and power off the service allows (`yes`
+//!   only: `challenge`, `no` and `na` hide the action). Hibernate is never
+//!   asked.
+//! - Re-reads when the service signals (a thread follows every signal from
+//!   `org.freedesktop.login1` under `/org/freedesktop/login1`: `SessionNew`,
+//!   `SessionRemoved`, the sessions' and seat's `PropertiesChanged`,
+//!   `PrepareForSleep`, and wakes the main loop; reads follow 150 ms after
+//!   the last one, so a burst is one read), on `refresh`, and every five
+//!   seconds whatever happens; never more than about three times a second.
 //! - Performs `ActivateSession`, `Suspend`, `Reboot` and `PowerOff` (never
 //!   interactive) on request and answers with `done`.
-//! - Without a bus (not up yet, or gone) reports `available: false` and tries
-//!   again every two seconds; it never exits for that.
+//! - One bus connection at a time. An error from the login service itself
+//!   (it is not on the bus, a call failed or took too long) keeps the
+//!   connection and tries again with a growing pause (one second to thirty).
+//!   Only a broken connection is closed, its signal thread waited for, and a
+//!   new one made two seconds later. Meanwhile it reports `available:
+//!   false`; it never exits for that.
 //!
 //! Every call and signal here is on the one service, and only the names
 //! below are used; nothing is passed to it that came from the greeter except
@@ -34,6 +40,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use reclogin::log;
@@ -63,8 +70,21 @@ const REREAD: Duration = Duration::from_secs(5);
 const SETTLE: Duration = Duration::from_millis(150);
 /// Another try at the bus this long after a failure.
 const RECONNECT: Duration = Duration::from_secs(2);
+/// The least time between two reads.
+const READ_GAP: Duration = Duration::from_millis(300);
+/// After an error of the login service, the next read waits this long at
+/// first, twice as long after each further error, at most `SERVICE_PAUSE_MOST`.
+const SERVICE_PAUSE_LEAST: Duration = Duration::from_secs(1);
+const SERVICE_PAUSE_MOST: Duration = Duration::from_secs(30);
+/// How often the end of an old connection's signal thread is looked for.
+const THREAD_CHECK: Duration = Duration::from_millis(200);
 /// No answer to a method call within this: an error, not a hang.
 const CALL_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The hidden switch of the one-shot `reclogind --end-user UID`.
+pub const END_USER: &str = "--end-user";
+/// How long that one call may take before it is given up.
+const END_USER_TIMEOUT: Duration = Duration::from_secs(4);
 
 const NOT_AVAILABLE: &str = "The login service is not available.";
 
@@ -80,13 +100,130 @@ pub fn run() -> ExitCode {
 }
 
 fn connect() -> zbus::Result<Connection> {
+    connect_with(CALL_TIMEOUT)
+}
+
+fn connect_with(timeout: Duration) -> zbus::Result<Connection> {
     zbus::blocking::connection::Builder::address(BUS_ADDRESS)?
-        .method_timeout(CALL_TIMEOUT)
+        .method_timeout(timeout)
         .build()
+}
+
+/// `reclogind --end-user UID`: one call, `TerminateUser(u)`, on the system
+/// bus, then exit. Run by the guest's cleanup (`guest.rs`), which cannot make
+/// the call itself because it must stay single-threaded. The service's
+/// answer does not matter to the caller (its own sweep follows); the exit
+/// status says whether the call went through.
+pub fn end_user() -> ExitCode {
+    if unsafe { libc::geteuid() } != 0 {
+        log(WHO, "--end-user must run as root");
+        return ExitCode::FAILURE;
+    }
+    let Some(uid) = std::env::args().nth(2).and_then(|a| a.parse::<u32>().ok()) else {
+        log(WHO, "--end-user needs a user number");
+        return ExitCode::from(2);
+    };
+    let call = connect_with(END_USER_TIMEOUT)
+        .and_then(|connection| manager(&connection)?.call::<_, _, ()>("TerminateUser", &(uid,)));
+    match call {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            log(WHO, format_args!("TerminateUser({uid}): {}", reason(&e)));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn nonblocking(stream: &UnixStream) -> io::Result<()> {
     stream.set_nonblocking(true)
+}
+
+/// The one connection to the bus, and the thread following its signals.
+struct Bus {
+    connection: Connection,
+    watch: Option<JoinHandle<()>>,
+}
+
+/// The connection's state in the loop.
+struct Link {
+    bus: Option<Bus>,
+    /// The signal thread of a connection that was closed, until it ended;
+    /// no new connection is made before it has.
+    closing: Option<(JoinHandle<()>, Instant)>,
+    said_thread_lingers: bool,
+    next_connect: Instant,
+    said_unreachable: bool,
+    /// After an error of the service: no read or call before this.
+    service_pause: Duration,
+    retry_at: Option<Instant>,
+}
+
+impl Link {
+    /// The connection broke: close it (its signal thread ends with it) and
+    /// make a new one later.
+    fn broken(&mut self) {
+        if let Some(bus) = self.bus.take() {
+            // Shared by the signal thread's clone: closing it ends that
+            // thread's wait as well.
+            let _ = bus.connection.close();
+            if let Some(watch) = bus.watch {
+                self.closing = Some((watch, Instant::now()));
+                self.said_thread_lingers = false;
+            }
+        }
+        self.next_connect = Instant::now() + RECONNECT;
+        self.retry_at = None;
+        self.service_pause = SERVICE_PAUSE_LEAST;
+    }
+
+    /// The service answered with an error (or not in time) on a good
+    /// connection: keep it, pause before the next try.
+    fn service_failed(&mut self) {
+        self.retry_at = Some(Instant::now() + self.service_pause);
+        self.service_pause = (self.service_pause * 2).min(SERVICE_PAUSE_MOST);
+    }
+
+    fn service_answered(&mut self) {
+        self.retry_at = None;
+        self.service_pause = SERVICE_PAUSE_LEAST;
+    }
+
+    /// An error from a call on the connection: the connection is broken
+    /// only if zbus says it is closed; anything else is the service's.
+    fn failed(&mut self, error: &zbus::Error) {
+        let closed = self
+            .bus
+            .as_ref()
+            .is_none_or(|bus| bus.connection.is_closed());
+        if closed {
+            log(WHO, format_args!("the bus connection broke: {error}"));
+            self.broken();
+        } else {
+            self.service_failed();
+        }
+    }
+
+    /// Whether an old connection's signal thread still runs (and so no
+    /// new connection may be made yet).
+    fn old_thread_runs(&mut self) -> bool {
+        let Some((watch, since)) = &self.closing else {
+            return false;
+        };
+        if watch.is_finished() {
+            if let Some((watch, _)) = self.closing.take() {
+                let _ = watch.join();
+            }
+            return false;
+        }
+        if !self.said_thread_lingers && since.elapsed() >= Duration::from_secs(5) {
+            log(
+                WHO,
+                "the old bus connection's signal thread has not ended; no new connection until it has",
+            );
+            self.said_thread_lingers = true;
+        }
+        true
+    }
 }
 
 fn serve(channel: &Channel) -> io::Result<()> {
@@ -95,57 +232,76 @@ fn serve(channel: &Channel) -> io::Result<()> {
     nonblocking(&wake_rx)?;
     nonblocking(&wake_tx)?;
 
-    let mut bus: Option<Connection> = None;
+    let mut link = Link {
+        bus: None,
+        closing: None,
+        said_thread_lingers: false,
+        next_connect: Instant::now(),
+        said_unreachable: false,
+        service_pause: SERVICE_PAUSE_LEAST,
+        retry_at: None,
+    };
     let mut last: Option<View> = None;
-    let mut next_connect = Instant::now();
     let mut next_read = Instant::now();
+    let mut last_read: Option<Instant> = None;
     let mut settle: Option<Instant> = None;
     // The first report is always sent, and `refresh` forces another.
     let mut force = true;
-    let mut said_unreachable = false;
 
     loop {
         let now = Instant::now();
-        if bus.is_none() && now >= next_connect {
+        if link.bus.is_none() && now >= link.next_connect && !link.old_thread_runs() {
             match connect() {
                 Ok(connection) => {
                     log(WHO, "connected to the system bus");
-                    said_unreachable = false;
-                    watch(&connection, wake_tx.try_clone()?);
-                    bus = Some(connection);
+                    link.said_unreachable = false;
+                    let watch = watch(&connection, wake_tx.try_clone()?);
+                    link.bus = Some(Bus { connection, watch });
+                    link.service_answered();
                     next_read = now;
                 }
                 Err(e) => {
-                    if !said_unreachable {
+                    if !link.said_unreachable {
                         log(WHO, format_args!("the system bus: {e}"));
-                        said_unreachable = true;
+                        link.said_unreachable = true;
                     }
-                    next_connect = now + RECONNECT;
+                    link.next_connect = now + RECONNECT;
                 }
             }
         }
 
-        let settled = settle.is_some_and(|t| now >= t);
-        if force || settled || now >= next_read {
+        // Never more than a few reads a second, and none during a pause
+        // after the service failed.
+        let wanted = force || settle.is_some_and(|t| now >= t) || now >= next_read;
+        let mut not_before = last_read.map_or(now, |t| t + READ_GAP);
+        if let Some(t) = link.retry_at {
+            not_before = not_before.max(t);
+        }
+        if wanted && now >= not_before {
             settle = None;
             force = false;
             next_read = now + REREAD;
-            let view = match &bus {
-                Some(connection) => match read(connection) {
-                    Ok(view) => view,
-                    Err(e) => {
-                        log(WHO, format_args!("reading the login service: {e}"));
-                        bus = None;
-                        next_connect = now + RECONNECT;
-                        View::default()
-                    }
-                },
+            last_read = Some(now);
+            let result = link.bus.as_ref().map(|bus| read(&bus.connection));
+            let view = match result {
+                Some(Ok(view)) => {
+                    link.service_answered();
+                    view
+                }
+                Some(Err(e)) => {
+                    log(WHO, format_args!("reading the login service: {e}"));
+                    link.failed(&e);
+                    View::default()
+                }
                 None => View::default(),
             };
             if last.as_ref() != Some(&view) {
                 channel.send(&FromHelper::Report(view.clone()), &[])?;
                 last = Some(view);
             }
+        } else if wanted {
+            // Due, but too soon: read as soon as allowed.
+            settle = Some(not_before);
         }
 
         // Wait for a request, a signal, or the next due time.
@@ -153,8 +309,11 @@ fn serve(channel: &Channel) -> io::Result<()> {
         if let Some(t) = settle {
             due = due.min(t);
         }
-        if bus.is_none() {
-            due = due.min(next_connect);
+        if link.bus.is_none() {
+            due = due.min(link.next_connect.max(now));
+        }
+        if link.closing.is_some() {
+            due = due.min(now + THREAD_CHECK);
         }
         let timeout = due
             .saturating_duration_since(Instant::now())
@@ -193,13 +352,13 @@ fn serve(channel: &Channel) -> io::Result<()> {
                 Ok(Some((request, _))) => match request {
                     ToHelper::Refresh => force = true,
                     ToHelper::Activate { request, id } => {
-                        let answer = act(&mut bus, &mut next_connect, |c| activate(c, &id));
+                        let answer = act(&mut link, |c| activate(c, &id));
                         channel.send(&done(request, answer), &[])?;
                         // What the call changed is read right away.
                         settle = Some(Instant::now());
                     }
                     ToHelper::Power { request, action } => {
-                        let answer = act(&mut bus, &mut next_connect, |c| power(c, action));
+                        let answer = act(&mut link, |c| power(c, action));
                         channel.send(&done(request, answer), &[])?;
                         settle = Some(Instant::now());
                     }
@@ -226,25 +385,25 @@ fn done(request: u64, answer: Result<(), String>) -> FromHelper {
     }
 }
 
-/// Run a request on the connection. A refusal by the service (an error
-/// reply) is its answer; any other error means the connection is gone, and
-/// it is dropped so that the loop makes a new one.
-fn act(
-    bus: &mut Option<Connection>,
-    next_connect: &mut Instant,
-    call: impl FnOnce(&Connection) -> zbus::Result<()>,
-) -> Result<(), String> {
-    let Some(connection) = bus.as_ref() else {
+/// Run a request on the connection. An error reply is the service's
+/// answer, and the connection stays; only a closed connection is replaced.
+/// A request is tried even during a pause after a failed read: the person
+/// asked for it now.
+fn act(link: &mut Link, call: impl FnOnce(&Connection) -> zbus::Result<()>) -> Result<(), String> {
+    let Some(bus) = link.bus.as_ref() else {
         return Err(NOT_AVAILABLE.into());
     };
-    match call(connection) {
+    let result = call(&bus.connection);
+    let closed = bus.connection.is_closed();
+    match result {
         Ok(()) => Ok(()),
         Err(e) => {
             let text = reason(&e);
             if !matches!(e, zbus::Error::MethodError(..)) {
                 log(WHO, format_args!("the login service: {e}"));
-                *bus = None;
-                *next_connect = Instant::now() + RECONNECT;
+            }
+            if closed {
+                link.broken();
             }
             Err(text)
         }
@@ -281,9 +440,9 @@ fn power(connection: &Connection, action: PowerAction) -> zbus::Result<()> {
     manager(connection)?.call::<_, _, ()>(method, &(false,))
 }
 
-/// A thread that follows every signal under the service's path and wakes
-/// the main loop. It ends when its connection does.
-fn watch(connection: &Connection, wake: UnixStream) {
+/// A thread that follows every signal the service sends under its path and
+/// wakes the main loop. It ends when its connection is closed.
+fn watch(connection: &Connection, wake: UnixStream) -> Option<JoinHandle<()>> {
     let connection = connection.clone();
     let spawned = std::thread::Builder::new()
         .name("login1-signals".into())
@@ -291,7 +450,8 @@ fn watch(connection: &Connection, wake: UnixStream) {
             use std::io::Write;
             let rule = MatchRule::builder()
                 .msg_type(Type::Signal)
-                .path_namespace(MANAGER_PATH)
+                .sender(SERVICE)
+                .and_then(|b| b.path_namespace(MANAGER_PATH))
                 .map(|b| b.build());
             let rule = match rule {
                 Ok(rule) => rule,
@@ -319,9 +479,13 @@ fn watch(connection: &Connection, wake: UnixStream) {
                 let _ = wake.write(&[1]);
             }
         });
-    if let Err(e) = spawned {
-        // The five-second re-read still keeps the screen right.
-        log(WHO, format_args!("starting the signal thread: {e}"));
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            // The five-second re-read still keeps the screen right.
+            log(WHO, format_args!("starting the signal thread: {e}"));
+            None
+        }
     }
 }
 
@@ -335,11 +499,10 @@ fn read(connection: &Connection) -> zbus::Result<View> {
     let listed: Vec<(String, u32, String, String, OwnedObjectPath)> =
         manager.call("ListSessions", &())?;
     let mut sessions = Vec::new();
+    // Every seat and none: the power question names people logged in over
+    // the network or on another seat too (`logind.rs`, `View::local`).
     for (id, uid, user, seat, path) in listed {
-        if seat != "seat0" {
-            continue;
-        }
-        let Ok(session) = session_of(connection, id, uid, user, &path) else {
+        let Ok(session) = session_of(connection, id, uid, user, seat, &path) else {
             continue;
         };
         if let Some(session) = session {
@@ -375,6 +538,7 @@ fn session_of(
     id: String,
     uid: u32,
     user: String,
+    seat: String,
     path: &OwnedObjectPath,
 ) -> zbus::Result<Option<SeatSession>> {
     let properties = Proxy::new(connection, SERVICE, path.as_ref(), PROPERTIES)?;
@@ -410,5 +574,10 @@ fn session_of(
         state,
         desktop: text("Desktop"),
         since,
+        seat,
+        remote: all
+            .get("Remote")
+            .and_then(|v| bool::try_from(v).ok())
+            .unwrap_or(false),
     }))
 }

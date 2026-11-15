@@ -29,6 +29,10 @@ use zeroize::Zeroizing;
 /// The protocol version both sides must agree on. `Hello` carries it.
 pub const VERSION: u32 = 2;
 
+/// The greeter's exit status when it cannot set a mode on the display it
+/// was given; reclogind names it in the log (and counts it like any failure).
+pub const GREETER_EXIT_NO_MODE: u8 = 4;
+
 /// The greeter's end of the socket is this file descriptor in the greeter.
 pub const GREETER_SOCKET_FD: i32 = 3;
 
@@ -87,9 +91,29 @@ pub enum ToGreeter {
     /// Exit now.
     Quit,
     /// Answer with `Pong { seq }` at once. Sent every few seconds while the
-    /// login console is shown; a greeter that has not answered within ten
-    /// seconds is taken as hung, ended and counted as a failure.
+    /// login console is shown, from the greeter's `Ready` on; a greeter that
+    /// has not answered within ten seconds is taken as hung, ended and
+    /// counted as a failure.
     Ping { seq: u64 },
+    /// The answer to an unconfirmed `Power` for Restart or Shut down while
+    /// people are logged in: show the question ("Shut down for everyone?")
+    /// with these people. reclogind honours `Power { confirmed: true }` only
+    /// for the same action, within a minute of this question, and only while
+    /// nobody has logged in since; otherwise it asks again.
+    PowerQuestion {
+        action: PowerAction,
+        people: Vec<LoggedIn>,
+    },
+}
+
+/// Someone with a running session, for the power question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggedIn {
+    /// The account name (`User::name` when the person is listed).
+    pub user: String,
+    /// Logged in over the network, not at this machine.
+    #[serde(default)]
+    pub remote: bool,
 }
 
 impl Framed for ToGreeter {
@@ -115,6 +139,7 @@ impl Framed for ToGreeter {
             ToGreeter::Resume => "resume",
             ToGreeter::Quit => "quit",
             ToGreeter::Ping { .. } => "ping",
+            ToGreeter::PowerQuestion { .. } => "power_question",
         }
     }
 }
@@ -159,7 +184,9 @@ pub struct State {
     pub power: Power,
     /// Whether the guest entry is shown.
     pub guest_offered: bool,
-    /// User names with a running session (for the power question).
+    /// User names with a running session of any kind, on any seat or over
+    /// the network. The power question itself comes from reclogind
+    /// (`ToGreeter::PowerQuestion`).
     #[serde(default)]
     pub others_logged_in: Vec<String>,
     /// The running sessions on this seat (what the login service says), for
@@ -272,8 +299,12 @@ pub enum ToDaemon {
     ChooseSession { id: String },
     /// Bring this logged-in user's session to the front.
     ReturnTo { user: String },
-    /// A power action. `confirmed` is true when the person agreed after
-    /// being told that others are logged in.
+    /// End the running guest session (the return screen's quiet button).
+    /// reclogind answers with `AuthResult`: `ok: true` when the session was
+    /// asked to end, else why not.
+    EndGuest,
+    /// A power action. `confirmed` is true when the person agreed to
+    /// reclogind's `PowerQuestion` for this action.
     Power {
         action: PowerAction,
         confirmed: bool,
@@ -303,6 +334,7 @@ impl Framed for ToDaemon {
             ToDaemon::Cancel => "cancel",
             ToDaemon::ChooseSession { .. } => "choose_session",
             ToDaemon::ReturnTo { .. } => "return_to",
+            ToDaemon::EndGuest => "end_guest",
             ToDaemon::Power { .. } => "power",
             ToDaemon::SetLayout { .. } => "set_layout",
             ToDaemon::SwitchConsole { .. } => "switch_console",

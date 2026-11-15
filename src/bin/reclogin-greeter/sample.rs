@@ -7,8 +7,10 @@
 //! questions (`messages`, `fields`), or on another screen: `row` (`"guest"`,
 //! `"other"` or a user name), `user_name`, `focus`, `menu` (the session menu
 //! open), `question` (the power question, `restart` or `shut_down`) and
-//! `running_since` (when the running sessions started, local time). See
-//! `assets/dev/state-*.json`.
+//! `running_since` (when the running sessions started, local time), and the
+//! on-screen keyboard: `keyboard` (open), `shift` (`once` or `lock`) and
+//! `symbols`. `--second-screen` draws what the other monitors show instead of
+//! the login. See `assets/dev/state-*.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +22,8 @@ use serde::Deserialize;
 use tiny_skia::Pixmap;
 
 use crate::form::{Answered, Field, Focus, Form, Row};
+use crate::input;
+use crate::osk::{self, Shift};
 use crate::paint::Look;
 use crate::screens::{self, login, Clock};
 
@@ -52,6 +56,12 @@ struct Sample {
     /// Every running session started at this local time, `YYYY-MM-DD HH:MM`
     /// (the file's `since` would depend on the machine's time zone).
     running_since: Option<String>,
+    /// The on-screen keyboard is open.
+    keyboard: bool,
+    /// Shift on the keyboard: `once` or `lock`.
+    shift: Option<String>,
+    /// The symbols key is down.
+    symbols: bool,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +82,8 @@ pub struct Options {
     pub at: Option<String>,
     /// How many characters the password field holds.
     pub typed: usize,
+    /// Draw the picture of the screens that do not show the login.
+    pub second: bool,
 }
 
 /// A state with no OS in it, for when no `--state` file is given.
@@ -173,7 +185,23 @@ pub fn render(options: &Options) -> Result<()> {
             running.since = Some(at.timestamp());
         }
     }
+    if options.second {
+        let mut pixmap = Pixmap::new(options.size.0, options.size.1).context("frame size")?;
+        let mut painter = look.begin(&mut pixmap);
+        screens::second::draw(&mut painter);
+        drop(painter);
+        return pixmap
+            .save_png(&options.png)
+            .with_context(|| format!("writing {}", options.png.display()));
+    }
     let mut form = Form::new(&state);
+    form.keyboard.table = input::table_for(
+        state
+            .layouts
+            .iter()
+            .find(|l| l.name == state.current_layout)
+            .or(state.layouts.first()),
+    );
     let mut typed = options.typed;
     if let Some(sample) = sample {
         typed = sample.typed.unwrap_or(typed);
@@ -213,6 +241,15 @@ pub fn render(options: &Options) -> Result<()> {
                 other => bail!("the sample's question {other:?} is not restart or shut_down"),
             };
             form.question = Some(action);
+            // What reclogind's `power_question` would list.
+            form.question_people = state
+                .others_logged_in
+                .iter()
+                .map(|user| reclogin::protocol::LoggedIn {
+                    user: user.clone(),
+                    remote: false,
+                })
+                .collect();
         }
         form.notice = sample.notice;
         form.caps_lock = sample.caps_lock;
@@ -227,6 +264,16 @@ pub fn render(options: &Options) -> Result<()> {
             });
         }
         form.talk.asked = !form.talk.fields.is_empty();
+        if sample.keyboard {
+            osk::open(&mut form, &state);
+            form.keyboard.shift = match sample.shift.as_deref() {
+                Some("once") => Shift::Once,
+                Some("lock") => Shift::Lock,
+                Some(other) => bail!("the sample's shift {other:?} is not once or lock"),
+                None => Shift::Off,
+            };
+            form.keyboard.symbols = sample.symbols;
+        }
     }
     for _ in 0..typed {
         form.password.push('x');

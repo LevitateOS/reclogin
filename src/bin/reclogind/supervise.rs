@@ -4,6 +4,11 @@
 //! - A greeter that exits without being asked to is replaced at once. One
 //!   that cannot even be started (missing program, missing account, an
 //!   unreachable socket) counts the same way.
+//! - A greeter that has its display and state but is not `ready` within a
+//!   minute, or once ready stops answering pings, is hung and counted the
+//!   same way (`greeter.rs`). One that cannot set a mode says so in its exit
+//!   status (`GREETER_EXIT_NO_MODE`), which the log names. A message
+//!   reclogind cannot encode is its own fault and never counted.
 //! - Three such failures within sixty seconds: reclogind gives up. It says
 //!   why in the system log and on standard error, gives the display up,
 //!   restores the console, writes one line on console 1, shows console 1
@@ -39,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use reclogin::config::Config;
 use reclogin::log;
-use reclogin::protocol::{ToGreeter, VERSION};
+use reclogin::protocol::{ToGreeter, GREETER_EXIT_NO_MODE, VERSION};
 
 use crate::console::{self, Console};
 use crate::display::Display;
@@ -193,7 +198,10 @@ impl Supervisor {
             },
             &[display.as_fd()],
         )?;
-        greeter.send(&ToGreeter::State(Box::new(state)), &[])
+        greeter.send(&ToGreeter::State(Box::new(state)), &[])?;
+        // Its minute to get ready starts (`greeter.rs`).
+        greeter.handshake_done();
+        Ok(())
     }
 
     /// Start greeters until one is up, counting each one that is not.
@@ -224,6 +232,10 @@ impl Daemon {
         // closed) and reaped. Both do nothing to one already reaped.
         let _ = self.greeter.child.kill();
         let status = match self.greeter.child.wait() {
+            // Its own word that the display took no mode (`kms.rs`).
+            Ok(status) if status.code() == Some(GREETER_EXIT_NO_MODE.into()) => {
+                format!("{status}: it could not set a mode on {}", self.display.path)
+            }
             Ok(status) => status.to_string(),
             Err(e) => format!("not reaped: {e}"),
         };

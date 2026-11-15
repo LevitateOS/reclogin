@@ -38,9 +38,23 @@ depend() {
 stop_post() {
 	# The wrapper was killed (retry's KILL): reclogind may still run. End it
 	# by its own pid (never by name: session workers are also "reclogind"),
-	# then give console 7 back; nothing happens when that was done already.
+	# and only while that pid is still the same process: its program is
+	# reclogind and its start time is the one the wrapper recorded (a session
+	# worker is reclogind too, so the program alone does not tell). Then give
+	# console 7 back; nothing happens when that was done already.
 	if [ -r /run/reclogin/reclogind.pid ]; then
-		kill -KILL "$(cat /run/reclogin/reclogind.pid)" 2>/dev/null
+		read -r pid started < /run/reclogin/reclogind.pid
+		case "$(readlink "/proc/${pid:-0}/exe" 2>/dev/null)" in
+		/usr/bin/reclogind | "/usr/bin/reclogind (deleted)")
+			stat=$(cat "/proc/$pid/stat" 2>/dev/null)
+			rest=${stat##*) }
+			# shellcheck disable=SC2086
+			set -- $rest
+			if [ -n "$started" ] && [ "${20}" = "$started" ]; then
+				kill -KILL "$pid" 2>/dev/null
+			fi
+			;;
+		esac
 		rm -f /run/reclogin/reclogind.pid
 	fi
 	/usr/bin/reclogind --reset-console 7 || true

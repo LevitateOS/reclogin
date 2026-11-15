@@ -1,8 +1,11 @@
 //! The users that may be chosen from the list.
 //!
-//! From `/etc/passwd`: uid 1000 to 60000, a login shell listed in
-//! `/etc/shells` (when that file exists), and a home folder that exists.
-//! Root and system accounts are never listed. AccountsService is not read.
+//! From `/etc/passwd` alone: uid 1000 to 60000, a login shell listed in
+//! `/etc/shells` (when that file exists), and a home field that is neither
+//! empty nor `/`. Nobody's home is looked at: a network home that hangs
+//! must not stop reclogind (and with it every console switch away from the
+//! login screen). Root and system accounts are never listed.
+//! AccountsService is not read.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -40,7 +43,7 @@ pub fn listable(passwd: &Path, shells: &Path) -> Vec<User> {
         } else if shell.ends_with("/nologin") || shell.ends_with("/false") || shell.is_empty() {
             continue;
         }
-        if fields[5].is_empty() || !Path::new(fields[5]).is_dir() {
+        if fields[5].is_empty() || fields[5] == "/" {
             continue;
         }
         let gecos = fields[4].split(',').next().unwrap_or("").trim();

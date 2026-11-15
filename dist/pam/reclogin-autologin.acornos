@@ -1,0 +1,18 @@
+# reclogin's automatic login. NO PASSWORD: the auth line below accepts
+# anyone. Only reclogin may start this service, and only the session worker's
+# automatic login does (src/bin/reclogind/autologin.rs): for the one account
+# named in /etc/reclogin.conf (`autologin`), at the start of reclogind, once
+# per boot, after the worker checked that the account is on the user list and
+# is not root. The worker has no conversation here and refuses any question.
+# Nothing else may name this service (a program that took it as its own PAM
+# service would need no password).
+#
+# Installed as /etc/pam.d/reclogin-autologin on AcornOS. The account and
+# session lines are those of /etc/pam.d/reclogin (dist/pam/reclogin.acornos),
+# so a locked account, an expired one or one outside its allowed times is
+# refused as in a normal login; only the auth line differs.
+auth      required   pam_permit.so
+account   include    base-account
+password  required   pam_deny.so
+session   include    base-session
+-session  optional   pam_elogind.so

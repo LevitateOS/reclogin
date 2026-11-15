@@ -1,7 +1,7 @@
 //! What the person has chosen, typed and focused on the login screen, and
 //! how keys and clicks change it. No drawing and no devices here.
 
-use reclogin::protocol::{MessageKind, PowerAction, PromptKind, State, User, Who};
+use reclogin::protocol::{LoggedIn, MessageKind, PowerAction, PromptKind, State, User, Who};
 use zeroize::{Zeroize, Zeroizing};
 
 /// The longest password accepted, in characters. With at most four bytes a
@@ -178,12 +178,16 @@ pub struct Form {
     pub menu: Option<usize>,
     pub talk: Talk,
     /// The power question ("Shut down for everyone?") is shown for this
-    /// action; only Restart and Shut down ask, and only when others are
-    /// logged in.
+    /// action. reclogind decides when it is asked (`power_question`); the
+    /// greeter never opens it by itself.
     pub question: Option<PowerAction>,
+    /// Who reclogind said is logged in, for the question.
+    pub question_people: Vec<LoggedIn>,
     /// `return_to` was sent: the answer clears `busy` again (success too,
     /// since the screen is not shown any more).
     pub returning: bool,
+    /// The on-screen keyboard.
+    pub keyboard: crate::osk::Osk,
 }
 
 impl Form {
@@ -202,7 +206,9 @@ impl Form {
             menu: None,
             talk: Talk::default(),
             question: None,
+            question_people: Vec::new(),
             returning: false,
+            keyboard: crate::osk::Osk::default(),
         };
         form.row = form.first_row(state);
         form.session = form.default_session(state);
@@ -244,9 +250,9 @@ impl Form {
         if self.row != before {
             self.focus = self.entry_focus(state);
         }
-        // A power action that is gone, or a question nobody needs any more
-        // (the others logged out): the question closes.
-        if self.question.is_some_and(|a| !power_asks(state, a)) {
+        // A power action that is gone: its question closes. (Whether it is
+        // still needed is reclogind's to say, when it is answered.)
+        if self.question.is_some_and(|a| !power_allowed(state, a)) {
             self.question = None;
             self.focus = self.entry_focus(state);
         }
@@ -309,7 +315,10 @@ impl Form {
 
     /// Whether the session picker is shown: only when there is a choice.
     pub fn picker(&self, state: &State) -> bool {
-        state.sessions.len() > 1 && !self.talking() && !matches!(self.screen(state), Screen::Return)
+        state.sessions.len() > 1
+            && !self.talking()
+            && !matches!(self.screen(state), Screen::Return)
+            && !(self.screen(state) == Screen::Guest && guest_running(state))
     }
 
     /// Where focus starts on the screen: where the person types first.
@@ -544,27 +553,35 @@ impl Form {
         None
     }
 
-    /// A footer power action was chosen (pointer, or Enter or Space on it).
-    /// Restart and Shut down while others are logged in open the question;
-    /// anything else is asked for at once. Not while a login is under way.
+    /// A footer power action was chosen (pointer, or Enter or Space on it):
+    /// asked for at once, unconfirmed. When people are logged in reclogind
+    /// answers a restart or shut down with its question ([`Form::ask_power`]).
+    /// Not while a login is under way.
     pub fn press_power(&mut self, action: PowerAction, state: &State) -> Option<Action> {
         if self.busy || !power_allowed(state, action) {
             return None;
         }
         self.notice = None;
         self.menu = None;
-        if power_asks(state, action) {
-            self.question = Some(action);
-            // Not on "… anyway": Enter must not shut everyone's work down.
-            self.focus = Focus::Cancel;
-            return None;
-        }
         self.question = None;
         self.focus = Focus::Power(action);
         Some(Action::Power {
             action,
             confirmed: false,
         })
+    }
+
+    /// reclogind asks before `action`: `people` are logged in.
+    pub fn ask_power(&mut self, action: PowerAction, people: Vec<LoggedIn>, state: &State) {
+        if self.busy || !power_allowed(state, action) {
+            return;
+        }
+        self.menu = None;
+        self.notice = None;
+        self.question = Some(action);
+        self.question_people = people;
+        // Not on "… anyway": Enter must not shut everyone's work down.
+        self.focus = Focus::Cancel;
     }
 
     /// Leave the power question: focus goes back to the footer action it
@@ -705,6 +722,8 @@ impl Form {
             Screen::Return => self
                 .chosen(state)
                 .map(|(_, u)| Goal::Return(u.name.clone())),
+            // A guest session already runs: back to it, not a second one.
+            Screen::Guest if guest_running(state) => Some(Goal::Return(GUEST.into())),
             Screen::Guest => Some(Goal::Begin(Who::Guest)),
             Screen::Other | Screen::NoUsers => {
                 let name = clean_user_name(&self.user_name);
@@ -742,6 +761,15 @@ impl Form {
     }
 }
 
+/// The guest's account name, as the login service reports its session.
+const GUEST: &str = "guest";
+
+/// Whether a guest session is running (the guest is not in `State::users`;
+/// the login service's list of running sessions has it).
+pub fn guest_running(state: &State) -> bool {
+    state.running.iter().any(|s| s.user == GUEST)
+}
+
 /// Whether the footer offers `action` (the login service allows it).
 pub fn power_allowed(state: &State, action: PowerAction) -> bool {
     match action {
@@ -749,14 +777,6 @@ pub fn power_allowed(state: &State, action: PowerAction) -> bool {
         PowerAction::Restart => state.power.restart,
         PowerAction::ShutDown => state.power.shut_down,
     }
-}
-
-/// Whether `action` asks first: Restart and Shut down end other people's
-/// sessions. Sleep keeps them.
-pub fn power_asks(state: &State, action: PowerAction) -> bool {
-    power_allowed(state, action)
-        && action != PowerAction::Sleep
-        && !state.others_logged_in.is_empty()
 }
 
 /// The footer's power actions in the order drawn and tabbed.
