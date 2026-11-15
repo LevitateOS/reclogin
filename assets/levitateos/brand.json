@@ -1,0 +1,33 @@
+{
+  "name": "LevitateOS",
+  "palette": {
+    "surface": "#14221A",
+    "surface_raised": "#1D2D24",
+    "surface_sunken": "#0D1711",
+    "text": "#F2EEE4",
+    "text_secondary": "#BAC5B7",
+    "text_muted": "#9AA89D",
+    "rule": "#3A4B40",
+    "accent": "#C7D9BA",
+    "accent_ink": "#14221A",
+    "action": "#B22F27",
+    "on_action": "#F2EEE4",
+    "bad": "#F0A497",
+    "warn": "#F0B866",
+    "ok": "#A9CF9A"
+  },
+  "mark": {
+    "view_box": [0, 0, 24, 24],
+    "paths": [
+      { "d": "M3.1 13.4C3.8 7.4 8.4 4.6 14.6 4.6c2.8 0 4.6-.7 6.8-2.2-.2 6.2-3.5 11.1-8.4 12.4-2.5.7-4.9.3-6.5-.8 1.9-2.5 4.2-4.2 7.4-5.7-4.1.9-7 2.7-9.3 5.4-.6.7-1.6.7-1.5-.3Z", "fill": true },
+      { "d": "M4.1 20.5c4.8-2.5 10.9-2.5 15.7-.2", "stroke_width": 1.9 }
+    ]
+  },
+  "background": "background.png",
+  "fonts": {
+    "files": ["Newsreader.ttf", "Newsreader-Italic.ttf", "NewsreaderDisplay.ttf", "NewsreaderDisplay-Italic.ttf", "InstrumentSans.ttf"],
+    "serif": "Newsreader",
+    "serif_display": "Newsreader Display",
+    "sans": "Instrument Sans"
+  }
+}

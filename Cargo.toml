@@ -7,8 +7,36 @@ license.workspace = true
 authors.workspace = true
 description = "One login screen for LevitateOS and AcornOS, in Rust"
 
-[[bin]]
-name = "reclogin"
-path = "src/main.rs"
+[lib]
+path = "src/lib.rs"
 
+[[bin]]
+name = "reclogind"
+path = "src/bin/reclogind/main.rs"
+
+[[bin]]
+name = "reclogin-greeter"
+path = "src/bin/reclogin-greeter/main.rs"
+
+# Every dependency must pass `cargo check` on a machine without the C
+# libraries' development files (the superproject's CI): no build script may
+# need pkg-config, bindgen or a system header. Linking against libinput,
+# libxkbcommon and libdrm happens only in the per-OS build.
 [dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zeroize = "1"
+# Kernel display (KMS): prebuilt bindings, no bindgen unless `use_bindgen`.
+drm = { version = "0.14", default-features = false }
+# Drawing on the processor; PNG decoding through the pure-Rust `png` crate.
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
+# Text: only the brand's fonts, no fontconfig.
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash"] }
+# libinput without udev: devices are added by path, opened by reclogind.
+input = { version = "0.10", default-features = false, features = ["libinput_1_19"] }
+xkbcommon = { version = "0.9", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+fontdb = { version = "0.23", default-features = false, features = ["std"] }
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
