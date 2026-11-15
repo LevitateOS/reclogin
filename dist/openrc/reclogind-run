@@ -1,0 +1,36 @@
+#!/bin/sh
+# reclogind under OpenRC (AcornOS), installed as
+# /usr/libexec/reclogin/reclogind-run and started by /etc/init.d/reclogin.
+#
+# OpenRC runs a service's stop_post only when the service is stopped on
+# request. A reclogind that dies by itself (SIGKILL, a crash the last resort
+# could not catch) would leave console 7 in graphics mode with its keyboard
+# off. This wrapper runs reclogind, passes SIGTERM, SIGINT and SIGHUP on to
+# it, and after it has ended, for whatever reason, gives console 7 back
+# (`reclogind --reset-console 7` does nothing when reclogind already did)
+# and exits with reclogind's status, so that status 3 (gave up) still shows.
+
+RECLOGIND=/usr/bin/reclogind
+PIDFILE=/run/reclogin/reclogind.pid
+
+"$RECLOGIND" "$@" &
+pid=$!
+mkdir -p /run/reclogin
+echo "$pid" > "$PIDFILE"
+
+trap 'kill -TERM "$pid" 2>/dev/null' TERM
+trap 'kill -INT "$pid" 2>/dev/null' INT
+trap 'kill -HUP "$pid" 2>/dev/null' HUP
+
+# `wait` returns early (above 128) when a trapped signal arrives; wait again
+# while reclogind exists (a process that has exited but is not yet waited for
+# still answers kill -0, so its real status is collected by the next wait).
+while :; do
+	wait "$pid"
+	status=$?
+	kill -0 "$pid" 2>/dev/null || break
+done
+
+rm -f "$PIDFILE"
+"$RECLOGIND" --reset-console 7 || true
+exit "$status"

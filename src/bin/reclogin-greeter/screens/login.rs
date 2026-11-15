@@ -5,7 +5,7 @@
 use reclogin::protocol::{MessageKind, PowerAction, PromptKind, State};
 
 use super::{Clock, Target};
-use crate::form::{Focus, Form};
+use crate::form::{Focus, Form, Row};
 use crate::paint::icons::{self, Icon};
 use crate::paint::text::{Face, Style};
 use crate::paint::Painter;
@@ -13,10 +13,10 @@ use crate::paint::Painter;
 /// The content box inside the frame art.
 pub(super) const LEFT: f32 = 250.0;
 pub(super) const TOP: f32 = 140.0;
-const WIDTH: f32 = 1420.0;
+pub(super) const WIDTH: f32 = 1420.0;
 pub(super) const HEIGHT: f32 = 800.0;
-const RIGHT: f32 = LEFT + WIDTH;
-const BOTTOM: f32 = TOP + HEIGHT;
+pub(super) const RIGHT: f32 = LEFT + WIDTH;
+pub(super) const BOTTOM: f32 = TOP + HEIGHT;
 
 /// The user list column and the column right of it.
 pub(super) const LIST_W: f32 = 420.0;
@@ -38,15 +38,12 @@ pub struct View<'a> {
 pub fn draw(p: &mut Painter, v: &View) {
     let pal = p.palette();
     let sans = |size: f32, color| Style::new(Face::Sans, size, color);
-    let caps_label = |color| sans(11.0, color).tracking(0.14);
 
     // --- the measures the vertical layout depends on --------------------
     let header_h = header_height(p);
-    let rows = v.state.users.len() + usize::from(v.state.guest_offered) + 1;
-    let label_h = p.line_height(&caps_label(pal.text_muted));
-    let list_h = label_h + 18.0 + 1.0 + rows as f32 * ROW_H;
+    let list_h = list_height(p, v);
 
-    let chosen = v.form.chosen.and_then(|i| v.state.users.get(i));
+    let chosen = v.form.chosen(v.state).map(|(_, u)| u);
     let first_name = chosen.map(|u| {
         u.real_name
             .split_whitespace()
@@ -68,14 +65,8 @@ pub fn draw(p: &mut Painter, v: &View) {
     }
     let greeting = p.lay(&spans, Some(FORM_W), false);
 
-    let lines = form_lines(v);
-    let heights: Vec<f32> = lines
-        .iter()
-        .map(|line| match line {
-            Line::Hint(_) => p.line_height(&sans(13.0, pal.text_muted)),
-            _ => p.line_height(&sans(15.0, pal.text)).max(18.0),
-        })
-        .collect();
+    let lines = form_lines(v, true);
+    let heights = line_heights(p, &lines);
     let lines_h: f32 = heights.iter().map(|h| 10.0 + h).sum();
     let password_block_h = p.line_height(&sans(12.0, pal.text)) + 10.0 + FIELD_H + lines_h;
     let form_h = greeting.height + 34.0 + password_block_h + 34.0 + 52.0;
@@ -87,68 +78,7 @@ pub fn draw(p: &mut Painter, v: &View) {
     header(p, v, header_h);
 
     // --- who is logging in ----------------------------------------------
-    p.text(
-        "WHO IS LOGGING IN",
-        caps_label(pal.text_muted),
-        LEFT,
-        grid_top,
-    );
-    let list_top = grid_top + label_h + 18.0;
-    p.rule_h(LEFT, list_top, LIST_W, 1.0, pal.rule);
-    let mut row_top = list_top + 1.0;
-    for (i, user) in v.state.users.iter().enumerate() {
-        let is_chosen = v.form.chosen == Some(i);
-        user_row(p, row_top, i, &user.real_name, user.logged_in, is_chosen);
-        if is_chosen && v.form.focus == Focus::Users {
-            p.border(LEFT, row_top, LIST_W, ROW_H - 1.0, 1.0, pal.accent);
-        }
-        p.hit(LEFT, row_top, LIST_W, ROW_H, Target::User(i));
-        row_top += ROW_H;
-    }
-    if v.state.guest_offered {
-        let center = row_top + (ROW_H - 1.0) / 2.0;
-        number_and_avatar_outline(p, center, None, false);
-        p.icon(
-            &icons::USER,
-            LEFT + 40.0 + 10.0,
-            center - 10.0,
-            20.0,
-            pal.text_secondary,
-        );
-        name_text_at(p, "Guest", center, pal.text_secondary, LIST_W);
-        let note = p.lay(
-            &[("Nothing is kept after logout", sans(13.0, pal.text_muted))],
-            None,
-            false,
-        );
-        p.put(
-            &note,
-            RIGHT_OF_LIST - note.width,
-            center - note.height / 2.0,
-        );
-        p.rule_h(LEFT, row_top + ROW_H - 1.0, LIST_W, 1.0, pal.rule);
-        p.hit(LEFT, row_top, LIST_W, ROW_H, Target::Guest);
-        row_top += ROW_H;
-    }
-    {
-        let center = row_top + (ROW_H - 1.0) / 2.0;
-        p.dashed_border(LEFT + 40.0, center - 20.0, 40.0, 40.0, pal.rule);
-        p.icon(
-            &icons::PLUS,
-            LEFT + 40.0 + 11.0,
-            center - 9.0,
-            18.0,
-            pal.text_muted,
-        );
-        let other = p.lay(
-            &[("Other user…", sans(16.0, pal.text_secondary))],
-            None,
-            false,
-        );
-        p.put(&other, LEFT + 98.0, center - other.height / 2.0);
-        p.rule_h(LEFT, row_top + ROW_H - 1.0, LIST_W, 1.0, pal.rule);
-        p.hit(LEFT, row_top, LIST_W, ROW_H, Target::OtherUser);
-    }
+    draw_list(p, v, grid_top);
 
     // --- greeting, password, log in -------------------------------------
     p.put(&greeting, FORM_X, grid_top);
@@ -162,93 +92,18 @@ pub fn draw(p: &mut Painter, v: &View) {
     let field_top = label_top + label_h12 + 10.0;
     password_field(p, v, field_top);
 
-    let mut y = field_top + FIELD_H;
-    for (line, &h) in lines.iter().zip(&heights) {
-        y += 10.0;
-        match line {
-            Line::Hint(text) => {
-                p.text(text, sans(13.0, pal.text_muted), FORM_X, y);
-            }
-            Line::Notice(kind, text) => {
-                let (color, icon) = message_look(p, *kind);
-                notice_line(p, text, color, icon, y, h);
-            }
-            Line::Caps => notice_line(p, "Caps Lock is on.", pal.warn, Some(&icons::CAPS), y, h),
-        }
-        y += h;
-    }
-
-    let buttons_top = y + 34.0;
-    let log_in = p.lay(
-        &[(
-            "LOG IN",
-            sans(13.0, pal.on_action).weight(600).tracking(0.1),
-        )],
-        None,
-        false,
-    );
-    let button_w = 34.0 + log_in.width + 34.0;
-    p.fill_rect(FORM_X, buttons_top, button_w, 52.0, pal.action);
-    p.put(
-        &log_in,
-        FORM_X + 34.0,
-        buttons_top + (52.0 - log_in.height) / 2.0,
-    );
-    if v.form.focus == Focus::LogIn {
-        p.border(
-            FORM_X - 4.0,
-            buttons_top - 4.0,
-            button_w + 8.0,
-            60.0,
-            1.0,
-            pal.text,
-        );
-    }
-    p.hit(FORM_X, buttons_top, button_w, 52.0, Target::LogIn);
-
-    let session = v
-        .form
-        .session
-        .as_ref()
-        .and_then(|id| v.state.sessions.iter().find(|s| &s.id == id));
-    if let Some(session) = session {
-        let x = FORM_X + button_w + 28.0;
-        let center = buttons_top + 26.0;
-        let label = p.lay(&[("Session", sans(15.0, pal.text_muted))], None, false);
-        p.put(&label, x, center - label.height / 2.0);
-        let name = p.lay(&[(&session.name, sans(15.0, pal.text))], None, false);
-        let name_x = x + label.width + 10.0;
-        let name_top = center - (name.height + 3.0) / 2.0;
-        p.put(&name, name_x, name_top);
-        p.rule_h(
-            name_x,
-            name_top + name.height + 2.0,
-            name.width,
-            1.0,
-            pal.rule,
-        );
-        let chevron_x = name_x + name.width + 10.0;
-        p.icon(
-            &icons::CHEVRON_DOWN,
-            chevron_x,
-            center - 7.0,
-            14.0,
-            pal.text_secondary,
-        );
-        let w = chevron_x + 14.0 - x;
-        if v.form.focus == Focus::Session {
-            p.border(x - 8.0, buttons_top, w + 16.0, 52.0, 1.0, pal.accent);
-        }
-        p.hit(x, buttons_top, w, 52.0, Target::Session);
-    }
-
+    let y = draw_lines(p, &lines, &heights, field_top + FIELD_H);
+    let menu = action_row(p, v, y + 34.0, "LOG IN");
     footer(p, v);
+    if let Some(menu) = menu {
+        session_menu(p, v, menu);
+    }
 }
 
 /// The right edge of the user list.
 const RIGHT_OF_LIST: f32 = LEFT + LIST_W;
 
-enum Line {
+pub(super) enum Line {
     Hint(String),
     Notice(MessageKind, String),
     Caps,
@@ -282,7 +137,7 @@ pub(super) fn failed(form: &Form) -> bool {
 /// The lines under the password field: PAM's messages of the last attempt,
 /// the error line and the Caps Lock warning when there are any (as in the
 /// wrong-password design), otherwise the layout hint.
-fn form_lines(v: &View) -> Vec<Line> {
+pub(super) fn form_lines(v: &View, hint: bool) -> Vec<Line> {
     let mut lines = Vec::new();
     for (kind, text) in &v.form.talk.messages {
         for part in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -297,7 +152,7 @@ fn form_lines(v: &View) -> Vec<Line> {
     if v.form.caps_lock {
         lines.push(Line::Caps);
     }
-    if lines.is_empty() {
+    if hint && lines.is_empty() {
         lines.push(Line::Hint(format!(
             "Typed with the {} layout.",
             layout_label(v.state)
@@ -401,14 +256,14 @@ fn name_text_at(p: &mut Painter, name: &str, center: f32, color: reclogin::brand
 pub(super) fn user_row(
     p: &mut Painter,
     top: f32,
-    index: usize,
+    index: Option<usize>,
     real_name: &str,
     logged_in: bool,
     chosen: bool,
 ) {
     let pal = p.palette();
     let center = top + (ROW_H - 1.0) / 2.0;
-    number_and_avatar_outline(p, center, Some(index), chosen);
+    number_and_avatar_outline(p, center, index, chosen);
     let initial: String = real_name
         .chars()
         .next()
@@ -560,9 +415,8 @@ pub(super) fn footer(p: &mut Painter, v: &View) {
     let center = row_top + 22.0;
     let style = Style::new(Face::Sans, 14.0, pal.text_secondary);
 
-    let layout = layout_label(v.state);
     let mut x = LEFT;
-    let w = footer_button(p, &icons::KEYBOARD, &layout, style, x, center);
+    let w = layout_switcher(p, v, style, x, center);
     if v.form.focus == Focus::Layout {
         p.border(x - 8.0, row_top, w + 16.0, 44.0, 1.0, pal.accent);
     }
@@ -607,4 +461,346 @@ fn footer_button(
     let laid = p.lay(&[(label, style)], None, false);
     p.put(&laid, x + 30.0, center - laid.height / 2.0);
     30.0 + laid.width
+}
+
+/// The height of the "Who is logging in" label and the list under it.
+pub(super) fn list_height(p: &Painter, v: &View) -> f32 {
+    let pal = p.palette();
+    let label_h = p.line_height(&Style::new(Face::Sans, 11.0, pal.text_muted).tracking(0.14));
+    let rows = v.state.users.len() + usize::from(v.state.guest_offered) + 1;
+    label_h + 18.0 + 1.0 + rows as f32 * ROW_H
+}
+
+/// The label and the list: the users, the guest, "Other user…". Whichever
+/// row is chosen is drawn as chosen, and a focused list gets its ring.
+pub(super) fn draw_list(p: &mut Painter, v: &View, grid_top: f32) {
+    let pal = p.palette();
+    let sans = |size: f32, color| Style::new(Face::Sans, size, color);
+    let label_h = p.line_height(&sans(11.0, pal.text_muted).tracking(0.14));
+    p.text(
+        "WHO IS LOGGING IN",
+        sans(11.0, pal.text_muted).tracking(0.14),
+        LEFT,
+        grid_top,
+    );
+    let list_top = grid_top + label_h + 18.0;
+    p.rule_h(LEFT, list_top, LIST_W, 1.0, pal.rule);
+    let ring = |p: &mut Painter, top: f32| {
+        if v.form.focus == Focus::Users {
+            p.border(LEFT, top, LIST_W, ROW_H - 1.0, 1.0, pal.accent);
+        }
+    };
+    let mut row_top = list_top + 1.0;
+    for (i, user) in v.state.users.iter().enumerate() {
+        let is_chosen = v.form.row == Row::User(user.name.clone());
+        user_row(
+            p,
+            row_top,
+            Some(i),
+            &user.real_name,
+            user.logged_in,
+            is_chosen,
+        );
+        if is_chosen {
+            ring(p, row_top);
+        }
+        p.hit(LEFT, row_top, LIST_W, ROW_H, Target::User(i));
+        row_top += ROW_H;
+    }
+    if v.state.guest_offered {
+        let chosen = v.form.row == Row::Guest;
+        let center = row_top + (ROW_H - 1.0) / 2.0;
+        number_and_avatar_outline(p, center, None, chosen);
+        if chosen {
+            p.icon(
+                &icons::USER_BOLD,
+                LEFT + 40.0 + 10.0,
+                center - 10.0,
+                20.0,
+                pal.accent_ink,
+            );
+        } else {
+            p.icon(
+                &icons::USER,
+                LEFT + 40.0 + 10.0,
+                center - 10.0,
+                20.0,
+                pal.text_secondary,
+            );
+        }
+        name_text_at(
+            p,
+            "Guest",
+            center,
+            if chosen { pal.text } else { pal.text_secondary },
+            LIST_W,
+        );
+        if !chosen {
+            let note = p.lay(
+                &[("Nothing is kept after logout", sans(13.0, pal.text_muted))],
+                None,
+                false,
+            );
+            p.put(
+                &note,
+                RIGHT_OF_LIST - note.width,
+                center - note.height / 2.0,
+            );
+        }
+        p.rule_h(LEFT, row_top + ROW_H - 1.0, LIST_W, 1.0, pal.rule);
+        if chosen {
+            ring(p, row_top);
+        }
+        p.hit(LEFT, row_top, LIST_W, ROW_H, Target::Guest);
+        row_top += ROW_H;
+    }
+    {
+        let chosen = v.form.row == Row::Other;
+        let center = row_top + (ROW_H - 1.0) / 2.0;
+        if chosen {
+            p.fill_rect(LEFT + 40.0, center - 20.0, 40.0, 40.0, pal.accent);
+            p.icon(
+                &icons::PLUS_BOLD,
+                LEFT + 40.0 + 11.0,
+                center - 9.0,
+                18.0,
+                pal.accent_ink,
+            );
+        } else {
+            p.dashed_border(LEFT + 40.0, center - 20.0, 40.0, 40.0, pal.rule);
+            p.icon(
+                &icons::PLUS,
+                LEFT + 40.0 + 11.0,
+                center - 9.0,
+                18.0,
+                pal.text_muted,
+            );
+        }
+        let other = p.lay(
+            &[(
+                "Other user…",
+                sans(16.0, if chosen { pal.text } else { pal.text_secondary }),
+            )],
+            None,
+            false,
+        );
+        p.put(&other, LEFT + 98.0, center - other.height / 2.0);
+        p.rule_h(LEFT, row_top + ROW_H - 1.0, LIST_W, 1.0, pal.rule);
+        if chosen {
+            ring(p, row_top);
+        }
+        p.hit(LEFT, row_top, LIST_W, ROW_H, Target::OtherUser);
+    }
+}
+
+/// Where the session menu opens: its left edge and the top of the row of
+/// buttons it belongs to.
+pub(super) struct Menu {
+    x: f32,
+    row_top: f32,
+}
+
+/// The main button, and beside it the session picker (only when there is a
+/// choice of sessions). `top` is the row's top; the row is 52 high.
+pub(super) fn action_row(p: &mut Painter, v: &View, top: f32, label: &str) -> Option<Menu> {
+    let pal = p.palette();
+    let sans = |size: f32, color| Style::new(Face::Sans, size, color);
+    let button = p.lay(
+        &[(label, sans(13.0, pal.on_action).weight(600).tracking(0.1))],
+        None,
+        false,
+    );
+    let button_w = 34.0 + button.width + 34.0;
+    p.fill_rect(FORM_X, top, button_w, 52.0, pal.action);
+    p.put(&button, FORM_X + 34.0, top + (52.0 - button.height) / 2.0);
+    if v.form.focus == Focus::LogIn {
+        p.border(FORM_X - 4.0, top - 4.0, button_w + 8.0, 60.0, 1.0, pal.text);
+    }
+    p.hit(FORM_X, top, button_w, 52.0, Target::LogIn);
+
+    if !v.form.picker(v.state) {
+        return None;
+    }
+    let session = v
+        .form
+        .session
+        .as_ref()
+        .and_then(|id| v.state.sessions.iter().find(|s| &s.id == id))?;
+    let open = v.form.menu.is_some();
+    let x = FORM_X + button_w + 28.0;
+    let center = top + 26.0;
+    let label = p.lay(&[("Session", sans(15.0, pal.text_muted))], None, false);
+    p.put(&label, x, center - label.height / 2.0);
+    let name = p.lay(&[(&session.name, sans(15.0, pal.text))], None, false);
+    let name_x = x + label.width + 10.0;
+    let name_top = center - (name.height + 3.0) / 2.0;
+    p.put(&name, name_x, name_top);
+    p.rule_h(
+        name_x,
+        name_top + name.height + 2.0,
+        name.width,
+        1.0,
+        if open { pal.accent } else { pal.rule },
+    );
+    let chevron_x = name_x + name.width + 10.0;
+    let chevron = if open {
+        &icons::CHEVRON_UP
+    } else {
+        &icons::CHEVRON_DOWN
+    };
+    p.icon(chevron, chevron_x, center - 7.0, 14.0, pal.text_secondary);
+    let w = chevron_x + 14.0 - x;
+    if v.form.focus == Focus::Session {
+        p.border(x - 8.0, top, w + 16.0, 52.0, 1.0, pal.accent);
+    }
+    p.hit(x, top, w, 52.0, Target::Session);
+    Some(Menu {
+        x: x + w + 20.0,
+        row_top: top,
+    })
+}
+
+/// The open session menu, drawn over everything else
+/// (`AcornOtherUser.dc.html`): "Installed desktops", then each session; the
+/// one in use is ticked, the highlighted one has the lighter ground.
+pub(super) fn session_menu(p: &mut Painter, v: &View, menu: Menu) {
+    let Some(highlight) = v.form.menu else {
+        return;
+    };
+    let pal = p.palette();
+    let sans = |size: f32, color| Style::new(Face::Sans, size, color);
+    const W: f32 = 300.0;
+    const OPTION_H: f32 = 50.0;
+    let head_style = sans(11.0, pal.text_muted).tracking(0.14);
+    let head_text_h = p.line_height(&head_style);
+    let head_h = 12.0 + head_text_h + 10.0 + 1.0;
+    let h = 1.0 + head_h + v.state.sessions.len() as f32 * OPTION_H + 1.0;
+    let mut top = menu.row_top - 34.0;
+    if top + h > BOTTOM {
+        top = (BOTTOM - h).max(TOP);
+    }
+    let x = menu.x;
+    p.fill_rect(x, top, W, h, pal.surface_raised);
+    p.border(x, top, W, h, 1.0, pal.rule);
+    p.hit(x, top, W, h, Target::Menu);
+    p.text(
+        "INSTALLED DESKTOPS",
+        head_style,
+        x + 1.0 + 18.0,
+        top + 1.0 + 12.0,
+    );
+    p.rule_h(x + 1.0, top + 1.0 + head_h - 1.0, W - 2.0, 1.0, pal.rule);
+    let lit = mix(pal.surface_raised, pal.accent, 0.065);
+    let mut y = top + 1.0 + head_h;
+    for (i, session) in v.state.sessions.iter().enumerate() {
+        let current = v.form.session.as_deref() == Some(session.id.as_str());
+        let lifted = i == highlight;
+        if lifted {
+            p.fill_rect(x + 1.0, y, W - 2.0, OPTION_H, lit);
+        }
+        let color = if current || lifted {
+            pal.text
+        } else {
+            pal.text_secondary
+        };
+        let name = p.lay(
+            &[(&session.name, sans(16.0, color))],
+            Some(W - 2.0 - 36.0 - 30.0),
+            true,
+        );
+        p.put(&name, x + 1.0 + 18.0, y + (OPTION_H - name.height) / 2.0);
+        if current {
+            p.icon(
+                &icons::CHECK,
+                x + W - 1.0 - 18.0 - 18.0,
+                y + (OPTION_H - 18.0) / 2.0,
+                18.0,
+                pal.accent,
+            );
+        }
+        p.hit(x + 1.0, y, W - 2.0, OPTION_H, Target::SessionOption(i));
+        y += OPTION_H;
+    }
+}
+
+/// `a` moved `t` of the way to `b`.
+fn mix(a: reclogin::brand::Rgb, b: reclogin::brand::Rgb, t: f32) -> reclogin::brand::Rgb {
+    let part = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    reclogin::brand::Rgb(part(a.0, b.0), part(a.1, b.1), part(a.2, b.2))
+}
+
+/// The keyboard icon and the configured layouts: with one it is a plain
+/// label; with several they are all shown, the one in use lit and
+/// underlined, and a click or Enter switches to the next. Returns the width.
+fn layout_switcher(p: &mut Painter, v: &View, style: Style, x: f32, center: f32) -> f32 {
+    let pal = p.palette();
+    if v.state.layouts.len() < 2 {
+        return footer_button(
+            p,
+            &icons::KEYBOARD,
+            &layout_label(v.state),
+            style,
+            x,
+            center,
+        );
+    }
+    p.icon(&icons::KEYBOARD, x, center - 10.0, 20.0, style.color);
+    let mut at = x + 30.0;
+    for (i, layout) in v.state.layouts.iter().enumerate() {
+        let current = layout.name == v.state.current_layout;
+        let color = if current { pal.text } else { pal.text_muted };
+        let laid = p.lay(&[(&layout.label, style.with_color(color))], None, false);
+        if current {
+            let top = center - (laid.height + 3.0) / 2.0;
+            p.put(&laid, at, top);
+            p.rule_h(at, top + laid.height + 2.0, laid.width, 1.0, pal.accent);
+        } else {
+            p.put(&laid, at, center - laid.height / 2.0);
+        }
+        at += laid.width;
+        if i + 1 < v.state.layouts.len() {
+            at += 10.0;
+        }
+    }
+    at - x
+}
+
+/// The height of each line under a field.
+pub(super) fn line_heights(p: &Painter, lines: &[Line]) -> Vec<f32> {
+    let pal = p.palette();
+    lines
+        .iter()
+        .map(|line| match line {
+            Line::Hint(_) => p.line_height(&Style::new(Face::Sans, 13.0, pal.text_muted)),
+            _ => p
+                .line_height(&Style::new(Face::Sans, 15.0, pal.text))
+                .max(18.0),
+        })
+        .collect()
+}
+
+/// Draw the lines under a field, each 10 below the one before, starting at
+/// `y`; returns where the last one ends.
+pub(super) fn draw_lines(p: &mut Painter, lines: &[Line], heights: &[f32], mut y: f32) -> f32 {
+    let pal = p.palette();
+    for (line, &h) in lines.iter().zip(heights) {
+        y += 10.0;
+        match line {
+            Line::Hint(text) => {
+                p.text(
+                    text,
+                    Style::new(Face::Sans, 13.0, pal.text_muted),
+                    FORM_X,
+                    y,
+                );
+            }
+            Line::Notice(kind, text) => {
+                let (color, icon) = message_look(p, *kind);
+                notice_line(p, text, color, icon, y, h);
+            }
+            Line::Caps => notice_line(p, "Caps Lock is on.", pal.warn, Some(&icons::CAPS), y, h),
+        }
+        y += h;
+    }
+    y
 }

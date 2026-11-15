@@ -27,9 +27,13 @@ RestartSec=1
 # better by starting again.
 RestartPreventExitStatus=2 3
 # SIGTERM to reclogind only: it tells the greeter to quit itself. Sending it
-# to the greeter as well would look like a crash and start a new one.
+# to the greeter as well would look like a crash and start a new one. A
+# running desktop is not in this unit: pam_systemd moved its session worker
+# into the session's scope, and it outlives reclogind.
 KillMode=mixed
-TimeoutStopSec=10
+# reclogind's stop can take up to 15 seconds (a login being set up is
+# waited for), plus the greeter's two.
+TimeoutStopSec=30
 StandardInput=null
 StandardOutput=journal
 StandardError=journal

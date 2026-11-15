@@ -103,3 +103,24 @@ pub const CHEVRON_LEFT: Icon = Icon {
     shapes: &[Path("m15 6-6 6 6 6")],
     stroke: 2.0,
 };
+
+/// The plus of the chosen "Other user…" row (a heavier stroke).
+pub const PLUS_BOLD: Icon = Icon {
+    shapes: &[Path("M12 5v14M5 12h14")],
+    stroke: 2.0,
+};
+
+/// The guest's mark on the chosen guest row (a heavier stroke).
+pub const USER_BOLD: Icon = Icon {
+    shapes: &[
+        Circle(12.0, 8.5, 3.5),
+        Path("M5 20c.8-3.6 3.5-5.5 7-5.5s6.2 1.900 7 5.500"),
+    ],
+    stroke: 1.8,
+};
+
+/// The session menu's chevron while the menu is open.
+pub const CHEVRON_UP: Icon = Icon {
+    shapes: &[Path("m6 15 6-6 6 6")],
+    stroke: 2.0,
+};

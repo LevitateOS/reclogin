@@ -38,7 +38,7 @@ use reclogin::protocol::{
 };
 use tiny_skia::Pixmap;
 
-use form::{Action, Focus, Form};
+use form::{Action, Focus, Form, Goal, Row};
 use input::{Happening, Input};
 use kms::Screen;
 use link::Link;
@@ -183,6 +183,12 @@ enum Next {
 fn run(locked: bool) -> Result<()> {
     sandbox::check(locked)?;
     let link = Rc::new(RefCell::new(Link::from_env()?));
+    // No new sockets from here on (Unix sockets in the file system, the
+    // system bus, the log sockets): before anything is read from reclogind
+    // or from input. The inherited socket keeps working.
+    if locked {
+        sandbox::no_new_sockets()?;
+    }
     let (brand_dir, display, state) = start(&mut link.borrow_mut())?;
     let brand = Brand::load(&brand_dir)?;
     let look = Look::load(brand)?;
@@ -322,6 +328,14 @@ impl Greeter {
         }
     }
 
+    /// Send a secret answer (`answer`, then the raw secret); `secret` is
+    /// overwritten when the caller drops it.
+    fn send_answer(&self, prompt_id: u64, secret: &Secret) {
+        if let Err(e) = self.link.borrow().send_answer(prompt_id, secret) {
+            log(WHO, format_args!("sending answer: {e}"));
+        }
+    }
+
     fn on_message(&mut self, message: ToGreeter, _handles: Vec<OwnedFd>) -> Next {
         match message {
             ToGreeter::State(state) => {
@@ -340,6 +354,10 @@ impl Greeter {
                     }
                 }
             }
+            // Sent before reclogind saw the cancel: the attempt is ending.
+            ToGreeter::Prompt { .. } | ToGreeter::Message { .. } if self.form.cancelling => {
+                return Next::Continue;
+            }
             ToGreeter::Prompt { id, kind, text } => {
                 // PAM's first question, when it is a secret one, takes the
                 // password typed on the login screen. Any other question is
@@ -350,10 +368,7 @@ impl Greeter {
                 self.form.talk.asked = true;
                 match (first, kind, self.pending.take()) {
                     (true, PromptKind::Secret, Some(secret)) => {
-                        self.send(&ToDaemon::Answer {
-                            prompt_id: id,
-                            text: secret,
-                        });
+                        self.send_answer(id, &secret);
                     }
                     _ => self.form.ask(id, kind, text),
                 }
@@ -361,7 +376,19 @@ impl Greeter {
             ToGreeter::Message { kind, text } => self.form.talk.messages.push((kind, text)),
             ToGreeter::AuthResult { ok, text } => {
                 self.pending = None;
-                self.form.finish(ok, text);
+                // The answer to a cancel (or the attempt's own end, which
+                // crossed it): the screen is free again.
+                let cancelled = std::mem::take(&mut self.form.cancelling);
+                self.form.finish(ok, text, &self.state);
+                if cancelled {
+                    self.form.talk.messages.clear();
+                }
+            }
+            ToGreeter::Ping { seq } => {
+                // Liveness: reclogind takes a greeter that does not answer
+                // within ten seconds as hung.
+                self.send(&ToDaemon::Pong { seq });
+                return Next::Continue;
             }
             ToGreeter::Pause => {
                 self.paused = true;
@@ -415,9 +442,11 @@ impl Greeter {
                 self.soft_pointer = Some((x, y));
             }
             Happening::Press(x, y) => {
+                // The last one drawn is on top (the session menu).
                 let target = self
                     .hits
                     .iter()
+                    .rev()
                     .find(|(area, _)| area.contains(x, y))
                     .map(|(_, t)| *t);
                 if let Some(target) = target {
@@ -429,11 +458,44 @@ impl Greeter {
     }
 
     fn press(&mut self, target: Target) {
+        // An open session menu takes the click: an entry picks, anything
+        // else closes it (the label itself toggles).
+        if self.form.menu.is_some() {
+            match target {
+                Target::SessionOption(i) => {
+                    if let Some(action) = self.form.pick_session(i, &self.state) {
+                        self.act(action);
+                    }
+                }
+                Target::Menu => {}
+                Target::Session => self.form.menu = None,
+                _ => {
+                    self.form.menu = None;
+                    self.press_outside_menu(target);
+                }
+            }
+            return;
+        }
+        self.press_outside_menu(target);
+    }
+
+    fn press_outside_menu(&mut self, target: Target) {
         match target {
             Target::User(i) => {
-                self.form.choose(i, &self.state);
-                self.form.focus = Focus::Password;
+                if let Some(user) = self.state.users.get(i) {
+                    self.form.select(Row::User(user.name.clone()), &self.state);
+                    self.form.entered(&self.state);
+                }
             }
+            Target::Guest => {
+                self.form.select(Row::Guest, &self.state);
+                self.form.entered(&self.state);
+            }
+            Target::OtherUser => {
+                self.form.select(Row::Other, &self.state);
+                self.form.entered(&self.state);
+            }
+            Target::UserName => self.form.focus = Focus::UserName,
             Target::Password => self.form.focus = Focus::Password,
             Target::ShowPassword => self.form.show_password = !self.form.show_password,
             Target::LogIn => {
@@ -443,50 +505,88 @@ impl Greeter {
                 }
             }
             Target::Cancel => self.act(Action::Cancel),
-            // The session menu and the layout switcher are later stages.
-            Target::Session => self.form.focus = Focus::Session,
-            Target::Layout => self.form.focus = Focus::Layout,
-            // Guest, other user, the on-screen keyboard and power are later stages.
-            Target::Guest | Target::OtherUser | Target::OnScreenKeyboard | Target::Power(_) => {}
+            Target::Session => self.form.open_menu(&self.state),
+            Target::Layout => {
+                if self.state.layouts.len() > 1 {
+                    self.form.focus = Focus::Layout;
+                    self.act(Action::NextLayout);
+                }
+            }
+            Target::SessionOption(_) | Target::Menu => {}
+            // The on-screen keyboard and power are later stages.
+            Target::OnScreenKeyboard | Target::Power(_) => {}
         }
+    }
+
+    /// Switch to the next configured layout: the keymap is compiled again
+    /// (what is typed from now on, and the "Typed with the … layout." line,
+    /// follow), and reclogind is told. It remembers nothing: the layout
+    /// lasts until the greeter is restarted.
+    fn next_layout(&mut self) {
+        let layouts = &self.state.layouts;
+        if layouts.len() < 2 {
+            return;
+        }
+        let at = layouts
+            .iter()
+            .position(|l| l.name == self.state.current_layout)
+            .unwrap_or(0);
+        let next = layouts[(at + 1) % layouts.len()].clone();
+        self.input.set_layout(&next);
+        self.state.current_layout = next.name.clone();
+        self.send(&ToDaemon::SetLayout { name: next.name });
     }
 
     fn act(&mut self, action: Action) {
         match action {
             Action::SwitchConsole(number) => self.send(&ToDaemon::SwitchConsole { number }),
+            Action::ChooseSession(id) => self.send(&ToDaemon::ChooseSession { id }),
+            Action::NextLayout => self.next_layout(),
             Action::Cancel => {
+                // Once per attempt. The form stays busy (no new `begin` can
+                // go out) and says it is waiting until reclogind answers with
+                // `auth_result`, once the attempt has really ended.
+                if self.form.cancelling {
+                    return;
+                }
                 self.pending = None;
-                self.form.finish(false, String::new());
-                self.form.talk.messages.clear();
+                self.form.cancelling = true;
+                self.form.busy = true;
+                self.form.talk.asking = None;
+                self.form.clear_password();
+                self.form.notice = Some((MessageKind::Info, "Cancelling…".into()));
                 self.send(&ToDaemon::Cancel);
             }
             Action::Submit => {
-                let secret = Secret::copy_from(&self.form.password);
                 if let Some((prompt_id, _)) = self.form.talk.asking {
+                    let secret = Secret::copy_from(&self.form.password);
                     self.form.answered();
-                    self.send(&ToDaemon::Answer {
-                        prompt_id,
-                        text: secret,
-                    });
+                    self.send_answer(prompt_id, &secret);
                     return;
                 }
-                self.form.clear_password();
-                self.form.notice = None;
-                self.form.busy = true;
-                self.form.talk = form::Talk::default();
-                let Some(user) = self.form.chosen.and_then(|i| self.state.users.get(i)) else {
-                    self.form.busy = false;
+                let Some(goal) = self.form.goal(&self.state) else {
                     return;
                 };
+                self.form.notice = None;
+                self.form.talk = form::Talk::default();
+                if let Goal::Return(user) = goal {
+                    // Stage 5 builds this; reclogind answers with a message.
+                    self.form.busy = true;
+                    self.send(&ToDaemon::ReturnTo { user });
+                    return;
+                }
+                let Goal::Begin(who) = goal else {
+                    return;
+                };
+                let password = matches!(who, Who::User { .. } | Who::TypedUser { .. });
+                let secret = password.then(|| Secret::copy_from(&self.form.password));
+                self.form.clear_password();
+                self.form.busy = true;
                 if let Some(id) = &self.form.session {
                     self.send(&ToDaemon::ChooseSession { id: id.clone() });
                 }
-                self.send(&ToDaemon::Begin {
-                    who: Who::User {
-                        name: user.name.clone(),
-                    },
-                });
-                self.pending = Some(secret);
+                self.send(&ToDaemon::Begin { who });
+                self.pending = secret;
             }
         }
     }

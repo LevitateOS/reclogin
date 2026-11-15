@@ -17,6 +17,9 @@ use reclogin::log;
 
 /// `EVIOCREVOKE`: `_IOW('E', 0x91, int)`.
 const EVIOCREVOKE: libc::c_ulong = 0x4004_4591;
+/// The most input devices open for the greeter at once (request ids are
+/// the greeter's; each one holds a descriptor here).
+const OPEN_MAX: usize = 64;
 /// The character-device major number of the input subsystem.
 const INPUT_MAJOR: u32 = 13;
 
@@ -37,6 +40,9 @@ impl Inputs {
         }
         if self.open.contains_key(&id) {
             return Err("request id already used".into());
+        }
+        if self.open.len() >= OPEN_MAX {
+            return Err(format!("{OPEN_MAX} devices are open already"));
         }
         let c_path = CString::new(name).map_err(|_| "bad path")?;
         let fd = unsafe {

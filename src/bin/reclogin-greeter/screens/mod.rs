@@ -6,22 +6,31 @@
 //! The normal login screen ([`login`]) also draws a failed attempt (the
 //! wrong-password design): PAM's messages and the error line under the
 //! field. While PAM asks further questions (an expired password) the
-//! [`conversation`] screen is drawn instead. Later stages add the others of
-//! the design canvas (other user, no users, guest, returning to a session,
-//! shutting down, the on-screen keyboard, the second monitor, the
-//! text-login fallback) beside them.
+//! [`conversation`] screen is drawn instead. [`other`] is "Other user…" and
+//! the screen of a system with no listed account; [`prompt`] is the guest and
+//! returning to a running session. Later stages add the rest of the design
+//! canvas (shutting down, the on-screen keyboard, the second monitor, the
+//! text-login fallback) beside them. The open session menu is drawn over
+//! whichever screen it belongs to.
 
 pub mod conversation;
 pub mod login;
+pub mod other;
+pub mod prompt;
 
+use crate::form::Screen;
 use crate::paint::Painter;
 
 /// Draw the screen the form is on.
 pub fn draw(p: &mut Painter, v: &login::View) {
     if v.form.talking() {
         conversation::draw(p, v);
-    } else {
-        login::draw(p, v);
+        return;
+    }
+    match v.form.screen(v.state) {
+        Screen::Login => login::draw(p, v),
+        Screen::Return | Screen::Guest => prompt::draw(p, v),
+        Screen::Other | Screen::NoUsers => other::draw(p, v),
     }
 }
 
@@ -34,12 +43,17 @@ pub enum Target {
     User(usize),
     Guest,
     OtherUser,
+    UserName,
     Password,
     ShowPassword,
     LogIn,
     /// "Cancel" and "Someone else" while PAM asks further questions.
     Cancel,
     Session,
+    /// One entry of the open session menu (index into `State::sessions`).
+    SessionOption(usize),
+    /// The open session menu's own area: a click there changes nothing.
+    Menu,
     Layout,
     OnScreenKeyboard,
     Power(PowerAction),

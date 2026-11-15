@@ -8,18 +8,25 @@
 # exits with status 3 and must stay stopped so the machine stays on its text
 # logins. supervise-daemon cannot leave out a respawn for one exit status,
 # so it is not used.
+#
+# OpenRC starts the wrapper reclogind-run, not reclogind itself: OpenRC runs
+# stop_post only on a requested stop, and the wrapper gives console 7 back
+# however reclogind ended. It passes SIGTERM, SIGINT and SIGHUP on.
 
 description="reclogin login screen"
 
-command="/usr/bin/reclogind"
+command="/usr/libexec/reclogin/reclogind-run"
 command_background="yes"
 pidfile="/run/${RC_SVCNAME}.pid"
 # reclogind writes to standard error; the give-up reason also goes to
 # syslog directly.
 output_logger="logger -t reclogind -p daemon.info"
 error_logger="logger -t reclogind -p daemon.err"
-# SIGTERM: reclogind tells the greeter to quit and gives the console back.
-retry="TERM/10/KILL/2"
+# SIGTERM (passed on by the wrapper): reclogind tells the greeter to quit,
+# waits up to 15 seconds for a login being set up to close, and gives the
+# console back. A running desktop is not ended: its session worker outlives
+# reclogind.
+retry="TERM/30/KILL/5"
 
 depend() {
 	need elogind dbus
@@ -29,7 +36,12 @@ depend() {
 }
 
 stop_post() {
-	# After a SIGKILL nobody gave console 7 back; this does, and does
-	# nothing when reclogind stopped cleanly.
+	# The wrapper was killed (retry's KILL): reclogind may still run. End it
+	# by its own pid (never by name: session workers are also "reclogind"),
+	# then give console 7 back; nothing happens when that was done already.
+	if [ -r /run/reclogin/reclogind.pid ]; then
+		kill -KILL "$(cat /run/reclogin/reclogind.pid)" 2>/dev/null
+		rm -f /run/reclogin/reclogind.pid
+	fi
 	/usr/bin/reclogind --reset-console 7 || true
 }

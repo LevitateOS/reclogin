@@ -14,7 +14,15 @@
 //!
 //! The messages between the worker and `reclogind` are [`ToWorker`] and
 //! [`FromWorker`], over the same kind of socket and framing as the greeter's
-//! ([`reclogin::wire`]). A secret crosses as [`Secret`], overwritten after use.
+//! ([`reclogin::wire`]). A secret is never in a message: `answer` announces
+//! it and it follows as a raw packet, read straight into a [`Secret`]
+//! (overwritten when dropped); [`receive`] reads both.
+//!
+//! Once its desktop runs the worker no longer depends on `reclogind`: it
+//! stops asking for a signal when `reclogind` dies and ignores the loss of
+//! its socket, waits for the desktop and closes the session by itself. A
+//! restarted `reclogind` knows nothing of such a session. Before that, losing
+//! `reclogind` ends the login.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -60,14 +68,62 @@ pub struct SessionRef {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToWorker {
-    /// First message: log `user` in and start `session`.
-    Start { user: String, session: SessionRef },
-    /// The answer to the last `Prompt`.
-    Answer { secret: Secret },
-    /// The answer to `NeedConsole`: the console the session is to have.
-    Console { number: u32 },
+    /// First message: log `user` in and start `session` on `console`
+    /// (`PAM_TTY` from the start; the console is handed to the user only
+    /// after the account check).
+    Start {
+        user: String,
+        session: SessionRef,
+        console: u32,
+    },
+    /// The answer to the last `Prompt`: the next packet is the secret, raw.
+    Answer,
     /// Abandon the login; or, once the session runs, end it.
     Cancel,
+}
+
+/// A message from `reclogind` as the worker uses it: `answer` with its
+/// secret already read.
+pub enum Command {
+    Start {
+        user: String,
+        session: SessionRef,
+        console: u32,
+    },
+    Answer(Secret),
+    Cancel,
+}
+
+/// Read the next message, and for `answer` the raw secret after it.
+/// `Ok(None)`: `reclogind` closed the socket.
+pub fn receive(channel: &Channel) -> io::Result<Option<Command>> {
+    Ok(match channel.recv::<ToWorker>()? {
+        None => None,
+        Some((
+            ToWorker::Start {
+                user,
+                session,
+                console,
+            },
+            _,
+        )) => Some(Command::Start {
+            user,
+            session,
+            console,
+        }),
+        Some((ToWorker::Answer, _)) => channel.recv_secret()?.map(Command::Answer),
+        Some((ToWorker::Cancel, _)) => Some(Command::Cancel),
+    })
+}
+
+impl Command {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Command::Start { .. } => "start",
+            Command::Answer(_) => "answer",
+            Command::Cancel => "cancel",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,13 +136,16 @@ pub enum FromWorker {
     /// The login failed before a session was started. `text` is the line
     /// for the screen; empty when PAM's own messages already said why.
     Failed { text: String },
-    /// PAM accepted the person: give the session a console.
-    NeedConsole,
+    /// PAM accepted the person and the account: the console is being handed
+    /// over and the PAM session opened.
+    Accepted,
     /// The PAM session is open on `console`: show that console. The worker
-    /// starts the desktop once the console is shown.
-    ReadyToStart { console: u32 },
-    /// The desktop's process runs.
-    Started,
+    /// starts the desktop once the console is shown. `x_server`: the X
+    /// server's process (and process group), for an X session.
+    ReadyToStart { console: u32, x_server: Option<i32> },
+    /// The desktop's process runs on `console`; `desktop` is its process id
+    /// and process group. From here the worker no longer needs `reclogind`.
+    Started { console: u32, desktop: i32 },
     /// The session is over and closed. `status` is the desktop process's
     /// wait status, or -1 when it never ran.
     Ended { status: i32 },
@@ -100,8 +159,7 @@ impl Framed for ToWorker {
     fn kind(&self) -> &'static str {
         match self {
             ToWorker::Start { .. } => "start",
-            ToWorker::Answer { .. } => "answer",
-            ToWorker::Console { .. } => "console",
+            ToWorker::Answer => "answer",
             ToWorker::Cancel => "cancel",
         }
     }
@@ -117,9 +175,9 @@ impl Framed for FromWorker {
             FromWorker::Prompt { .. } => "prompt",
             FromWorker::Message { .. } => "message",
             FromWorker::Failed { .. } => "failed",
-            FromWorker::NeedConsole => "need_console",
+            FromWorker::Accepted => "accepted",
             FromWorker::ReadyToStart { .. } => "ready_to_start",
-            FromWorker::Started => "started",
+            FromWorker::Started { .. } => "started",
             FromWorker::Ended { .. } => "ended",
         }
     }
@@ -193,13 +251,13 @@ impl Conversation for Talk<'_> {
             if self.cancelled {
                 return None;
             }
-            match self.channel.recv::<ToWorker>() {
-                Ok(Some((ToWorker::Answer { secret }, _))) => return Some(secret),
-                Ok(Some((ToWorker::Cancel, _))) | Ok(None) => {
+            match receive(self.channel) {
+                Ok(Some(Command::Answer(secret))) => return Some(secret),
+                Ok(Some(Command::Cancel)) | Ok(None) => {
                     self.cancelled = true;
                     return None;
                 }
-                Ok(Some((other, _))) => {
+                Ok(Some(other)) => {
                     log(WHO, format_args!("unexpected {} ignored", other.kind()));
                 }
                 Err(e) => {
@@ -229,6 +287,7 @@ impl Conversation for Talk<'_> {
 // the worker's life
 
 pub fn run() -> ExitCode {
+    crate::supervise::handle_stray_signals();
     match serve() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -277,9 +336,13 @@ fn signals() -> Result<OwnedFd> {
 fn serve() -> Result<()> {
     let channel = channel()?;
     let signals = signals()?;
-    let (user, session) = match channel.recv::<ToWorker>()? {
-        Some((ToWorker::Start { user, session }, _)) => (user, session),
-        Some((other, _)) => bail!("expected start, got {}", other.kind()),
+    let (user, session, console) = match receive(&channel)? {
+        Some(Command::Start {
+            user,
+            session,
+            console,
+        }) => (user, session, console),
+        Some(other) => bail!("expected start, got {}", other.kind()),
         None => return Ok(()),
     };
     let fail = |text: &str| channel.send(&FromWorker::Failed { text: text.into() }, &[]);
@@ -301,6 +364,15 @@ fn serve() -> Result<()> {
             return Ok(());
         }
     };
+    // The console from the start, as login(1) does: modules that check the
+    // terminal (pam_securetty, pam_access, pam_time) see it while
+    // authenticating. PAM_RUSER and PAM_RHOST stay unset (a local login).
+    let rc = pam.set_item(pam::TTY, &format!("tty{console}"));
+    if rc != pam::SUCCESS {
+        log(WHO, format_args!("setting PAM_TTY: {}", pam.describe(rc)));
+        fail(AUTH_FAILED)?;
+        return Ok(());
+    }
 
     // Who you are.
     let rc = pam.authenticate();
@@ -363,15 +435,7 @@ fn serve() -> Result<()> {
         }
     };
 
-    channel.send(&FromWorker::NeedConsole, &[])?;
-    let console = loop {
-        match channel.recv::<ToWorker>()? {
-            Some((ToWorker::Console { number }, _)) => break number,
-            Some((ToWorker::Cancel, _)) | None => return Ok(()),
-            Some((other, _)) => log(WHO, format_args!("unexpected {} ignored", other.kind())),
-        }
-    };
-
+    channel.send(&FromWorker::Accepted, &[])?;
     session::run(&mut pam, &account, &plan, console, &channel, &signals);
     Ok(())
 }

@@ -1,0 +1,42 @@
+{
+  "hostname": "workstation",
+  "users": [],
+  "sessions": [
+    {
+      "id": "plasma",
+      "name": "Plasma (Wayland)",
+      "kind": "wayland"
+    },
+    {
+      "id": "plasmax11",
+      "name": "Plasma (X11)",
+      "kind": "x11"
+    }
+  ],
+  "last_session_for": {},
+  "last_user": null,
+  "layouts": [
+    {
+      "name": "us",
+      "label": "English (US)",
+      "xkb_layout": "us",
+      "xkb_variant": "",
+      "xkb_model": "",
+      "xkb_options": ""
+    }
+  ],
+  "current_layout": "us",
+  "power": {
+    "sleep": true,
+    "restart": true,
+    "shut_down": true
+  },
+  "guest_offered": false,
+  "others_logged_in": [],
+  "clock_24h": true,
+  "idle_seconds": null,
+  "sample": {
+    "typed": 0,
+    "focus": "user_name"
+  }
+}

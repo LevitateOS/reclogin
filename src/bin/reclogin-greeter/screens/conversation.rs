@@ -96,12 +96,12 @@ pub fn draw(p: &mut Painter, v: &View) {
     let list_top = grid_top + label_h + 18.0;
     p.rule_h(LEFT, list_top, LIST_W, 1.0, pal.rule);
     let row_top = list_top + 1.0;
-    if let Some((i, user)) = v
-        .form
-        .chosen
-        .and_then(|i| v.state.users.get(i).map(|u| (i, u)))
-    {
-        user_row(p, row_top, i, &user.real_name, user.logged_in, true);
+    if let Some((i, user)) = v.form.chosen(v.state) {
+        user_row(p, row_top, Some(i), &user.real_name, user.logged_in, true);
+    } else {
+        // A name typed under "Other user…".
+        let name = crate::form::clean_user_name(&v.form.user_name);
+        user_row(p, row_top, None, &name, false, true);
     }
     let back_top = row_top + ROW_H;
     let back_center = back_top + BACK_H / 2.0;

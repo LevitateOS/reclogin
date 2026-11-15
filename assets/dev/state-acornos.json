@@ -22,6 +22,11 @@
       "id": "lxqt",
       "name": "LXQt",
       "kind": "x11"
+    },
+    {
+      "id": "openbox",
+      "name": "Openbox",
+      "kind": "x11"
     }
   ],
   "last_session_for": {},

@@ -1,0 +1,59 @@
+{
+  "hostname": "workbench",
+  "users": [
+    {
+      "name": "ada",
+      "real_name": "Ada Lindqvist",
+      "logged_in": false
+    },
+    {
+      "name": "kai",
+      "real_name": "Kai Moreno",
+      "logged_in": true
+    },
+    {
+      "name": "noor",
+      "real_name": "Noor Haddad",
+      "logged_in": false
+    }
+  ],
+  "sessions": [
+    {
+      "id": "lxqt",
+      "name": "LXQt",
+      "kind": "x11"
+    },
+    {
+      "id": "openbox",
+      "name": "Openbox",
+      "kind": "x11"
+    }
+  ],
+  "last_session_for": {},
+  "last_user": "ada",
+  "layouts": [
+    {
+      "name": "us",
+      "label": "English (US)",
+      "xkb_layout": "us",
+      "xkb_variant": "",
+      "xkb_model": "",
+      "xkb_options": ""
+    }
+  ],
+  "current_layout": "us",
+  "power": {
+    "sleep": true,
+    "restart": true,
+    "shut_down": true
+  },
+  "guest_offered": true,
+  "others_logged_in": [
+    "kai"
+  ],
+  "clock_24h": true,
+  "idle_seconds": null,
+  "sample": {
+    "row": "guest"
+  }
+}

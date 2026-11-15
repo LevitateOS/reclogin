@@ -13,6 +13,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
 use reclogin::protocol::{MessageKind, PromptKind, Secret};
@@ -280,7 +281,10 @@ unsafe extern "C" fn converse<C: Conversation>(
                 } else {
                     PromptKind::Visible
                 };
-                let Some(answer) = talker.ask(kind, &text) else {
+                // A panic must not unwind into libpam (it would abort the
+                // worker with the session open): it refuses the conversation.
+                let asked = catch_unwind(AssertUnwindSafe(|| talker.ask(kind, &text)));
+                let Ok(Some(answer)) = asked else {
                     drop_replies(replies, n);
                     return CONV_ERR;
                 };
@@ -300,8 +304,17 @@ unsafe extern "C" fn converse<C: Conversation>(
                 (*replies.add(i)).resp = buffer.cast();
                 // `answer` is overwritten as it goes out of scope here.
             }
-            ERROR_MSG => talker.tell(MessageKind::Error, &text),
-            TEXT_INFO => talker.tell(MessageKind::Info, &text),
+            style @ (ERROR_MSG | TEXT_INFO) => {
+                let kind = if style == ERROR_MSG {
+                    MessageKind::Error
+                } else {
+                    MessageKind::Info
+                };
+                if catch_unwind(AssertUnwindSafe(|| talker.tell(kind, &text))).is_err() {
+                    drop_replies(replies, n);
+                    return CONV_ERR;
+                }
+            }
             // Binary and radio prompts are not Linux-PAM's text conversation.
             _ => {
                 drop_replies(replies, n);

@@ -4,7 +4,9 @@
 //! A `--state` file is a [`State`] in JSON. It may also carry a `"sample"`
 //! object (ignored by everything else) that puts the form in a state PAM
 //! would leave it in: a failed attempt (`notice`, `caps_lock`), or further
-//! questions (`messages`, `fields`). See `assets/dev/state-*-password.json`.
+//! questions (`messages`, `fields`), or on another screen: `row` (`"guest"`,
+//! `"other"` or a user name), `user_name`, `focus`, `menu` (the session menu
+//! open). See `assets/dev/state-*.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +17,7 @@ use reclogin::protocol::{Layout, MessageKind, Power, PromptKind, State, User};
 use serde::Deserialize;
 use tiny_skia::Pixmap;
 
-use crate::form::{Answered, Field, Form};
+use crate::form::{Answered, Field, Focus, Form, Row};
 use crate::paint::Look;
 use crate::screens::{self, login, Clock};
 
@@ -35,6 +37,14 @@ struct Sample {
     caps_lock: bool,
     messages: Vec<(MessageKind, String)>,
     fields: Vec<SampleField>,
+    /// The chosen row: `guest`, `other`, or a user name.
+    row: Option<String>,
+    /// The typed user name.
+    user_name: String,
+    /// `users`, `user_name`, `password`, `session`, `layout`, `log_in`.
+    focus: Option<String>,
+    /// The session menu is open.
+    menu: bool,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +158,30 @@ pub fn render(options: &Options) -> Result<()> {
     let mut typed = options.typed;
     if let Some(sample) = sample {
         typed = sample.typed.unwrap_or(typed);
+        if let Some(row) = &sample.row {
+            let row = match row.as_str() {
+                "guest" => Row::Guest,
+                "other" => Row::Other,
+                name => Row::User(name.to_string()),
+            };
+            form.select(row, &state);
+            form.entered(&state);
+        }
+        form.user_name = sample.user_name;
+        if sample.menu {
+            form.open_menu(&state);
+        }
+        if let Some(focus) = &sample.focus {
+            form.focus = match focus.as_str() {
+                "users" => Focus::Users,
+                "user_name" => Focus::UserName,
+                "password" => Focus::Password,
+                "session" => Focus::Session,
+                "layout" => Focus::Layout,
+                "log_in" => Focus::LogIn,
+                other => bail!("the sample's focus {other:?} is not one of users, user_name, password, session, layout, log_in"),
+            };
+        }
         form.notice = sample.notice;
         form.caps_lock = sample.caps_lock;
         form.talk.messages = sample.messages;

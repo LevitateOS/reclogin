@@ -9,17 +9,21 @@
 //! read-only view of its data through Landlock) is in [`crate::sandbox`],
 //! applied here between fork and exec unless `--no-sandbox` was given.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use reclogin::protocol::{GREETER_SOCKET_ENV, GREETER_SOCKET_FD};
+use reclogin::protocol::{Framed, GREETER_SOCKET_ENV, GREETER_SOCKET_FD};
 use reclogin::wire::Channel;
+use serde::Serialize;
+use zeroize::Zeroizing;
 
 use crate::sandbox;
 
@@ -48,9 +52,136 @@ pub fn configure(settings: Settings) {
     let _ = SETTINGS.set(settings);
 }
 
+/// The most messages waiting for a greeter that does not read.
+const OUTBOX_MAX: usize = 64;
+/// A greeter whose queue has not moved for this long is hung.
+const STUCK_AFTER: Duration = Duration::from_secs(5);
+/// How often a shown greeter is asked whether it is alive.
+const PING_EVERY: Duration = Duration::from_secs(3);
+/// How long it has to answer.
+const PONG_WITHIN: Duration = Duration::from_secs(10);
+
 pub struct Greeter {
     pub child: Child,
+    /// reclogind's end, non-blocking: sending never waits for the greeter.
     pub channel: Channel,
+    /// Messages that did not fit in the socket yet, oldest first, with
+    /// copies of their handles; sent from the main loop when it can write.
+    outbox: VecDeque<(Zeroizing<Vec<u8>>, Vec<OwnedFd>)>,
+    /// Since when the oldest waiting message has not moved.
+    stuck_since: Option<Instant>,
+    next_seq: u64,
+    /// The ping not answered yet and when it was sent.
+    ping: Option<(u64, Instant)>,
+    next_ping: Instant,
+}
+
+impl Greeter {
+    /// Send `message` with `handles`, or queue it when the socket is full.
+    /// An error means the greeter cannot be reached (or its queue is full):
+    /// the caller treats it as gone.
+    pub fn send<M: Serialize + Framed>(
+        &mut self,
+        message: &M,
+        handles: &[BorrowedFd<'_>],
+    ) -> io::Result<()> {
+        let bytes = Channel::encode(message, handles.len())?;
+        if self.outbox.is_empty() {
+            match self.channel.send_packet(&[&bytes], handles) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if self.outbox.len() >= OUTBOX_MAX {
+            return Err(io::Error::other("its queue of messages is full"));
+        }
+        let handles = handles
+            .iter()
+            .map(|h| h.try_clone_to_owned())
+            .collect::<io::Result<Vec<_>>>()?;
+        self.outbox.push_back((bytes, handles));
+        self.stuck_since.get_or_insert_with(Instant::now);
+        Ok(())
+    }
+
+    /// Whether messages wait for the socket to take them (poll for writing).
+    pub fn wants_write(&self) -> bool {
+        !self.outbox.is_empty()
+    }
+
+    /// Send what waits, as far as the socket takes it.
+    pub fn flush(&mut self) -> io::Result<()> {
+        while let Some((bytes, handles)) = self.outbox.front() {
+            let borrowed: Vec<BorrowedFd<'_>> = handles.iter().map(|h| h.as_fd()).collect();
+            match self.channel.send_packet(&[bytes], &borrowed) {
+                Ok(()) => {
+                    self.outbox.pop_front();
+                    self.stuck_since = (!self.outbox.is_empty()).then(Instant::now);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Why the greeter counts as hung now, if it does: its queue has not
+    /// moved for five seconds, or a ping was not answered within ten.
+    pub fn hung(&self, now: Instant) -> Option<&'static str> {
+        if self
+            .stuck_since
+            .is_some_and(|t| now.duration_since(t) >= STUCK_AFTER)
+        {
+            return Some("stopped reading its socket for five seconds");
+        }
+        if self
+            .ping
+            .is_some_and(|(_, sent)| now.duration_since(sent) >= PONG_WITHIN)
+        {
+            return Some("did not answer a ping within ten seconds");
+        }
+        None
+    }
+
+    /// The ping to send now, if one is due (none while one is unanswered).
+    pub fn ping_due(&mut self, now: Instant) -> Option<u64> {
+        if self.ping.is_some() || now < self.next_ping {
+            return None;
+        }
+        self.next_seq += 1;
+        self.ping = Some((self.next_seq, now));
+        Some(self.next_seq)
+    }
+
+    /// `pong { seq }` arrived.
+    pub fn pong(&mut self, seq: u64) {
+        if self.ping.is_some_and(|(sent, _)| sent == seq) {
+            self.ping = None;
+            self.next_ping = Instant::now() + PING_EVERY;
+        }
+    }
+
+    /// The login console was left: no pings until it is shown again.
+    pub fn stop_pinging(&mut self) {
+        self.ping = None;
+        self.next_ping = Instant::now() + PING_EVERY;
+    }
+
+    /// The next moment `tick` has something to check for this greeter;
+    /// `pinging`: whether pings are sent now (the login console is shown).
+    /// `None`: nothing.
+    pub fn next_deadline(&self, pinging: bool) -> Option<Instant> {
+        let ping = match self.ping {
+            Some((_, sent)) => Some(sent + PONG_WITHIN),
+            None => pinging.then_some(self.next_ping),
+        };
+        let stuck = self.stuck_since.map(|t| t + STUCK_AFTER);
+        match (ping, stuck) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 struct Account {
@@ -180,8 +311,19 @@ pub fn start_with(program: &Path, account_name: &str, settings: &Settings) -> Re
         .with_context(|| format!("starting {} as {account_name}", program.display()))?;
     drop(theirs);
     drop(prepared);
-    Ok(Greeter {
+    let mut greeter = Greeter {
         child,
         channel: ours,
-    })
+        outbox: VecDeque::new(),
+        stuck_since: None,
+        next_seq: 0,
+        ping: None,
+        next_ping: Instant::now() + PING_EVERY,
+    };
+    if let Err(e) = greeter.channel.set_nonblocking() {
+        let _ = greeter.child.kill();
+        let _ = greeter.child.wait();
+        return Err(e).context("making the greeter's socket non-blocking");
+    }
+    Ok(greeter)
 }

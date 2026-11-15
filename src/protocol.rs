@@ -8,10 +8,13 @@
 //! packet, and a packet whose handle count differs from what its message
 //! announces is refused.
 //!
-//! The only message that may carry a secret is [`ToDaemon::Answer`]. Its text
-//! is a [`Secret`]: overwritten when dropped, never shown by `Debug`, and
-//! sent as a JSON array of byte values so that no string escaping leaves a
-//! copy behind.
+//! No message carries a secret. [`ToDaemon::Answer`] announces one: the
+//! packet right after it is the answer's raw bytes, sent and received by
+//! [`crate::wire::Channel::send_secret`] and
+//! [`crate::wire::Channel::recv_secret`] straight from and into a
+//! [`Secret`] (overwritten when dropped, never shown by `Debug`). Inside JSON
+//! it would pass through serde's intermediate buffer for internally tagged
+//! messages, which is freed without being overwritten.
 //!
 //! Adding a field later: give it `#[serde(default)]` so that an older peer's
 //! messages still read. Changing a field's meaning needs a new [`VERSION`].
@@ -20,12 +23,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
-use serde::de::{SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 /// The protocol version both sides must agree on. `Hello` carries it.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// The greeter's end of the socket is this file descriptor in the greeter.
 pub const GREETER_SOCKET_FD: i32 = 3;
@@ -80,6 +82,10 @@ pub enum ToGreeter {
     Resume,
     /// Exit now.
     Quit,
+    /// Answer with `Pong { seq }` at once. Sent every few seconds while the
+    /// login console is shown; a greeter that has not answered within ten
+    /// seconds is taken as hung, ended and counted as a failure.
+    Ping { seq: u64 },
 }
 
 impl Framed for ToGreeter {
@@ -103,6 +109,7 @@ impl Framed for ToGreeter {
             ToGreeter::Pause => "pause",
             ToGreeter::Resume => "resume",
             ToGreeter::Quit => "quit",
+            ToGreeter::Ping { .. } => "ping",
         }
     }
 }
@@ -229,8 +236,9 @@ pub enum ToDaemon {
     CloseDevice { request_id: u64 },
     /// Start a login for this person. PAM's questions come back as `Prompt`.
     Begin { who: Who },
-    /// The answer to `Prompt { id: prompt_id, .. }`.
-    Answer { prompt_id: u64, text: Secret },
+    /// The answer to `Prompt { id: prompt_id, .. }`. The next packet is the
+    /// answer itself, raw (`Channel::send_secret`), never JSON.
+    Answer { prompt_id: u64 },
     /// Abandon the login attempt in progress.
     Cancel,
     /// The session to start after a successful login.
@@ -249,6 +257,8 @@ pub enum ToDaemon {
     /// switch consoles itself, and the kernel does not see keys while the
     /// login console is in graphics mode.
     SwitchConsole { number: u32 },
+    /// The answer to `Ping { seq }`.
+    Pong { seq: u64 },
 }
 
 impl Framed for ToDaemon {
@@ -269,6 +279,7 @@ impl Framed for ToDaemon {
             ToDaemon::Power { .. } => "power",
             ToDaemon::SetLayout { .. } => "set_layout",
             ToDaemon::SwitchConsole { .. } => "switch_console",
+            ToDaemon::Pong { .. } => "pong",
         }
     }
 }
@@ -319,6 +330,14 @@ impl Secret {
         Secret(bytes)
     }
 
+    /// Copy raw bytes into new storage, at most [`SECRET_MAX`] of them.
+    pub fn from_bytes(bytes: &[u8]) -> Secret {
+        let end = bytes.len().min(SECRET_MAX);
+        let mut storage = Zeroizing::new(Vec::with_capacity(SECRET_MAX));
+        storage.extend_from_slice(&bytes[..end]);
+        Secret(storage)
+    }
+
     pub fn expose(&self) -> &[u8] {
         &self.0
     }
@@ -331,36 +350,5 @@ impl Secret {
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Secret(<hidden>)")
-    }
-}
-
-impl Serialize for Secret {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0.iter())
-    }
-}
-
-impl<'de> Deserialize<'de> for Secret {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Secret, D::Error> {
-        struct Bytes;
-        impl<'de> Visitor<'de> for Bytes {
-            type Value = Secret;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "an array of at most {SECRET_MAX} byte values")
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Secret, A::Error> {
-                let mut bytes = Zeroizing::new(Vec::with_capacity(SECRET_MAX));
-                while let Some(byte) = seq.next_element::<u8>()? {
-                    if bytes.len() == SECRET_MAX {
-                        return Err(serde::de::Error::custom("secret too long"));
-                    }
-                    bytes.push(byte);
-                }
-                Ok(Secret(bytes))
-            }
-        }
-        deserializer.deserialize_seq(Bytes)
     }
 }

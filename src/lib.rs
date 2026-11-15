@@ -18,6 +18,11 @@ pub mod protocol;
 pub mod wire;
 
 /// Prefix every log line with the program's name. Never pass a secret here.
+///
+/// A failed write is ignored rather than a panic (`eprintln!` panics): a
+/// session worker whose `reclogind` is gone may have lost the reader of its
+/// standard error, and must still close its session.
 pub fn log(who: &str, text: impl std::fmt::Display) {
-    eprintln!("{who}: {text}");
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{who}: {text}");
 }

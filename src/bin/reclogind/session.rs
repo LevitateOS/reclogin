@@ -6,19 +6,25 @@
 //! PAM environment (the login service's PAM module reads them), `reclogind`
 //! shows that console, and then the desktop's process is forked: a session
 //! of its own with the console as its controlling terminal and standard
-//! input, the user's groups and ids, PAM's environment, and the session
-//! file's `Exec` run through the user's login shell so their profile is
-//! read. When it exits the PAM session is closed and the console given back.
+//! input, the groups the worker has after `initgroups` and PAM's credential
+//! modules (as login(1)), the user's ids, PAM's environment, its output and
+//! errors in the user's own `session.log`, and the session file's `Exec`
+//! (split by the Desktop Entry rules, each word quoted for the shell) run
+//! through the user's login shell so their profile is read. When it exits
+//! the PAM session is closed and the console given back to root.
 //!
-//! Wayland sessions only. X sessions are stage 3: the X server is started
-//! for the user on the console between opening the PAM session and running
-//! `Exec` (a module `xserver.rs`, called where [`read`] refuses them now).
+//! An X session differs in two places: the X server is started for the
+//! user on the console ([`crate::xserver`]) after the PAM session is open and
+//! before `reclogind` is told the session is ready, and the desktop's
+//! process gets `DISPLAY` and `XAUTHORITY` but not the console as its
+//! controlling terminal (the X server holds it). The server is stopped when
+//! the desktop's process has ended, before the PAM session is closed.
 
 use std::ffi::{CStr, CString};
 use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -27,12 +33,12 @@ use reclogin::protocol::SessionKind;
 use reclogin::wire::Channel;
 
 use crate::pam::{self, Pam};
-use crate::sessions::WAYLAND_DIR;
-use crate::worker::{next_signal, FromWorker, SessionRef, Talk, ToWorker};
+use crate::sessions::{WAYLAND_DIR, X11_DIR};
+use crate::worker::{next_signal, receive, Command, FromWorker, SessionRef, Talk};
+use crate::xserver;
 
 const WHO: &str = "reclogind (session worker)";
 
-const X_NOT_BUILT: &str = "X sessions are not built yet.";
 const NOT_STARTED: &str = "The session could not be started.";
 
 /// The `PATH` a session gets when PAM's environment names none.
@@ -66,9 +72,14 @@ pub fn read(session: &SessionRef) -> Result<Plan, String> {
     }
     let dir = match session.kind {
         SessionKind::Wayland => WAYLAND_DIR,
-        // Stage 3: read from `X11_DIR`; `run` then starts the X server
-        // (`xserver.rs`) before `Exec`.
-        SessionKind::X11 => return Err(X_NOT_BUILT.into()),
+        // Before anyone types a password for a session that cannot start.
+        SessionKind::X11 => {
+            if xserver::program().is_none() {
+                log(WHO, "an X session was chosen, but no X server is installed");
+                return Err(xserver::NO_SERVER.into());
+            }
+            X11_DIR
+        }
     };
     let path = Path::new(dir).join(format!("{id}.desktop"));
     let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -120,8 +131,6 @@ pub struct Account {
     pub gid: libc::gid_t,
     pub home: String,
     pub shell: String,
-    /// Supplementary groups, from the group database.
-    pub groups: Vec<libc::gid_t>,
 }
 
 impl Account {
@@ -158,28 +167,12 @@ impl Account {
         if shell.is_empty() {
             shell = "/bin/sh".into();
         }
-        let mut groups = vec![0 as libc::gid_t; 256];
-        let mut count = groups.len() as libc::c_int;
-        loop {
-            let rc = unsafe {
-                libc::getgrouplist(c_name.as_ptr(), gid, groups.as_mut_ptr(), &mut count)
-            };
-            if rc >= 0 {
-                groups.truncate(count.max(0) as usize);
-                break;
-            }
-            if count as usize <= groups.len() || groups.len() >= 65536 {
-                return Err(io::Error::other("cannot read the account's groups"));
-            }
-            groups.resize(count as usize, 0);
-        }
         Ok(Account {
             name: text(pwd.pw_name),
             uid,
             gid,
             home,
             shell,
-            groups,
         })
     }
 }
@@ -204,9 +197,6 @@ fn group_id(name: &str) -> Option<libc::gid_t> {
 /// The console device, handed to the user and given back at the end.
 struct Tty {
     fd: OwnedFd,
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    mode: libc::mode_t,
 }
 
 impl Tty {
@@ -216,17 +206,7 @@ impl Tty {
             .write(true)
             .custom_flags(libc::O_NOCTTY | libc::O_CLOEXEC)
             .open(format!("/dev/tty{number}"))?;
-        let fd: OwnedFd = file.into();
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let tty = Tty {
-            fd,
-            uid: st.st_uid,
-            gid: st.st_gid,
-            mode: st.st_mode & 0o7777,
-        };
+        let tty = Tty { fd: file.into() };
         let group = group_id("tty").unwrap_or(account.gid);
         if unsafe { libc::fchown(tty.fd.as_raw_fd(), account.uid, group) } != 0
             || unsafe { libc::fchmod(tty.fd.as_raw_fd(), 0o620) } != 0
@@ -239,17 +219,26 @@ impl Tty {
     }
 
     /// Cut off whatever of the session still holds the console, and give it
-    /// back to its old owner.
+    /// back to root.
     fn give_back(&self) {
-        let fd = self.fd.as_raw_fd();
-        unsafe {
-            libc::ioctl(fd, TIOCVHANGUP as _, 0 as libc::c_long);
-            if libc::fchown(fd, self.uid, self.gid) != 0 || libc::fchmod(fd, self.mode) != 0 {
-                log(
-                    WHO,
-                    format_args!("giving the console back: {}", io::Error::last_os_error()),
-                );
-            }
+        give_console_back(self.fd.as_raw_fd());
+    }
+}
+
+/// A console device as nobody's: whatever still has it open is cut off
+/// (hang-up), and it is root's, group `tty` (root's group when there is
+/// none), mode 0620. Never a remembered owner: that could be a user whose
+/// session was not closed. Used by the worker at the end of a session and by
+/// `reclogind` after a worker that did not close its session.
+pub fn give_console_back(fd: RawFd) {
+    let group = group_id("tty").unwrap_or(0);
+    unsafe {
+        libc::ioctl(fd, TIOCVHANGUP as _, 0 as libc::c_long);
+        if libc::fchown(fd, 0, group) != 0 || libc::fchmod(fd, 0o620) != 0 {
+            log(
+                WHO,
+                format_args!("giving the console back: {}", io::Error::last_os_error()),
+            );
         }
     }
 }
@@ -276,6 +265,12 @@ pub fn run(
         })
     };
 
+    // A cancel that came while PAM checked the account: nothing is handed
+    // over or opened.
+    if cancel_waiting(channel) {
+        log(WHO, "cancelled before the session was opened");
+        return;
+    }
     let tty = match Tty::hand_over(console, account) {
         Ok(tty) => tty,
         Err(e) => {
@@ -299,7 +294,8 @@ pub fn run(
         SessionKind::Wayland => "wayland",
         SessionKind::X11 => "x11",
     };
-    let mut rc = pam.set_item(pam::TTY, &format!("tty{console}"));
+    // PAM_TTY was set before authentication (`worker.rs`).
+    let mut rc = pam::SUCCESS;
     for (name, value) in [
         ("XDG_SEAT", "seat0"),
         ("XDG_VTNR", vtnr.as_str()),
@@ -318,6 +314,26 @@ pub fn run(
         return;
     }
 
+    // The account's groups first, so that PAM's credential modules
+    // (pam_group) add to them; the session keeps the result (as login(1)).
+    let Ok(c_name) = CString::new(account.name.as_str()) else {
+        tty.give_back();
+        failed();
+        return;
+    };
+    if unsafe { libc::initgroups(c_name.as_ptr(), account.gid) } != 0 {
+        log(
+            WHO,
+            format_args!(
+                "reading {}'s groups: {}",
+                account.name,
+                io::Error::last_os_error()
+            ),
+        );
+        tty.give_back();
+        failed();
+        return;
+    }
     let rc = pam.setcred(pam::ESTABLISH_CRED);
     if rc != pam::SUCCESS {
         log(WHO, format_args!("credentials: {}", pam.describe(rc)));
@@ -357,7 +373,7 @@ pub fn run(
         tty.give_back();
     };
 
-    let prepared = match Prepared::new(pam, account, plan) {
+    let mut prepared = match Prepared::new(pam, account, plan) {
         Ok(prepared) => prepared,
         Err(e) => {
             log(WHO, format_args!("preparing the session: {e}"));
@@ -367,10 +383,56 @@ pub fn run(
         }
     };
 
+    // An X session: the X server first, while the greeter can still be told
+    // that it did not start.
+    let mut x = None;
+    if plan.kind == SessionKind::X11 {
+        match xserver::start(
+            account,
+            console,
+            tty.fd.as_raw_fd(),
+            &prepared.env,
+            channel,
+            signals,
+        ) {
+            Ok(server) => {
+                let display = server.display().to_string();
+                let auth = server.auth_path().to_string_lossy().into_owned();
+                for (name, value) in [("DISPLAY", display), ("XAUTHORITY", auth)] {
+                    let prefix = format!("{name}=");
+                    prepared
+                        .env
+                        .retain(|e| !e.to_bytes().starts_with(prefix.as_bytes()));
+                    match CString::new(format!("{name}={value}")) {
+                        Ok(pair) => prepared.env.push(pair),
+                        Err(_) => log(WHO, format_args!("{name} holds a zero byte")),
+                    }
+                }
+                x = Some(server);
+            }
+            Err(xserver::StartError::Failed(text)) => {
+                close(pam);
+                send(&FromWorker::Failed { text: text.into() });
+                return;
+            }
+            Err(xserver::StartError::Cancelled) => {
+                close(pam);
+                send(&FromWorker::Ended { status: -1 });
+                return;
+            }
+        }
+    }
+
     // From here the greeter is gone: every end is `Ended`.
-    send(&FromWorker::ReadyToStart { console });
+    send(&FromWorker::ReadyToStart {
+        console,
+        x_server: x.as_ref().map(|x| x.pid()),
+    });
     if !wait_until_shown(console, channel) {
         log(WHO, "cancelled before the session started");
+        if let Some(x) = x.as_mut() {
+            x.stop();
+        }
         close(pam);
         send(&FromWorker::Ended { status: -1 });
         return;
@@ -380,6 +442,9 @@ pub fn run(
         Ok(pid) => pid,
         Err(e) => {
             log(WHO, format_args!("starting {}: {e}", plan.exec));
+            if let Some(x) = x.as_mut() {
+                x.stop();
+            }
             close(pam);
             send(&FromWorker::Ended { status: -1 });
             return;
@@ -392,10 +457,25 @@ pub fn run(
             account.name, plan.id
         ),
     );
-    send(&FromWorker::Started);
+    // The desktop runs: from here the worker outlives `reclogind` (no
+    // signal when it dies, its socket's loss ignored) and closes the
+    // session by itself when the desktop ends.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, 0 as libc::c_ulong, 0, 0, 0);
+    }
+    send(&FromWorker::Started {
+        console,
+        desktop: pid,
+    });
 
-    let status = wait_for_end(pid, channel, signals);
+    let status = match x.as_mut() {
+        Some(x) => x.wait_for_end(pid, channel, signals),
+        None => wait_for_end(pid, channel, signals),
+    };
     log(WHO, format_args!("{}'s session ended", account.name));
+    if let Some(x) = x.as_mut() {
+        x.stop();
+    }
     close(pam);
     send(&FromWorker::Ended { status });
 }
@@ -408,7 +488,14 @@ struct Prepared {
     home: CString,
     uid: libc::uid_t,
     gid: libc::gid_t,
-    groups: Vec<libc::gid_t>,
+    /// Folders to make (as the user, in order) and the file the desktop's
+    /// output and errors go to: `$XDG_STATE_HOME/reclogin/session.log`, else
+    /// `~/.local/state/reclogin/session.log`.
+    log_dirs: Vec<CString>,
+    log_file: CString,
+    /// Whether the console becomes the process's controlling terminal: not
+    /// in an X session, whose X server has it already.
+    controlling_tty: bool,
 }
 
 impl Prepared {
@@ -442,16 +529,52 @@ impl Prepared {
 
         // A session bus: the login service's, or one for this session.
         let bus = has(&env, "DBUS_SESSION_BUS_ADDRESS") || user_bus_appears(account.uid);
+        let words = exec_words(&plan.exec).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the session's Exec cannot be read: {:?}", plan.exec),
+            )
+        })?;
+        let quoted: Vec<String> = words.iter().map(|w| shell_quote(w)).collect();
         let command = if bus {
-            format!("exec {}", plan.exec)
+            format!("exec {}", quoted.join(" "))
         } else {
-            format!("exec dbus-run-session -- {}", plan.exec)
+            format!("exec dbus-run-session -- {}", quoted.join(" "))
         };
+        let shell = login_shell(&account.shell);
+
+        // The session's own log, in the user's state folder.
+        let state_home = env
+            .iter()
+            .find(|(n, v)| n == "XDG_STATE_HOME" && v.starts_with('/'))
+            .map(|(_, v)| v.clone());
+        let mut dirs = Vec::new();
+        let state = match state_home {
+            Some(dir) => {
+                dirs.push(dir.clone());
+                dir
+            }
+            None => {
+                let local = format!("{}/.local", account.home.trim_end_matches('/'));
+                dirs.push(local.clone());
+                let state = format!("{local}/state");
+                dirs.push(state.clone());
+                state
+            }
+        };
+        let own = format!("{}/reclogin", state.trim_end_matches('/'));
+        dirs.push(own.clone());
+        let log_file = CString::new(format!("{own}/session.log")).map_err(bad)?;
+        let log_dirs = dirs
+            .into_iter()
+            .map(CString::new)
+            .collect::<Result<_, _>>()
+            .map_err(bad)?;
 
         Ok(Prepared {
-            shell: CString::new(account.shell.as_str()).map_err(bad)?,
+            shell: CString::new(shell).map_err(bad)?,
             argv: vec![
-                CString::new(account.shell.as_str()).map_err(bad)?,
+                CString::new(shell).map_err(bad)?,
                 CString::new("-l").map_err(bad)?,
                 CString::new("-c").map_err(bad)?,
                 CString::new(command).map_err(bad)?,
@@ -464,7 +587,9 @@ impl Prepared {
             home: CString::new(account.home.as_str()).map_err(bad)?,
             uid: account.uid,
             gid: account.gid,
-            groups: account.groups.clone(),
+            log_dirs,
+            log_file,
+            controlling_tty: plan.kind != SessionKind::X11,
         })
     }
 
@@ -492,19 +617,51 @@ impl Prepared {
             // Rust ignores SIGPIPE in its programs; a desktop must not inherit that.
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             if libc::setsid() < 0
-                || libc::ioctl(tty_fd, TIOCSCTTY as _, 0 as libc::c_long) < 0
+                || (self.controlling_tty
+                    && libc::ioctl(tty_fd, TIOCSCTTY as _, 0 as libc::c_long) < 0)
                 || libc::dup2(tty_fd, 0) < 0
             {
                 libc::_exit(126);
             }
-            // Standard output and error stay the worker's: the system log.
             libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
-            if libc::setgroups(self.groups.len(), self.groups.as_ptr()) != 0
-                || libc::setgid(self.gid) != 0
+            // The groups stay the worker's: the account's (initgroups) and
+            // what PAM's credential modules added.
+            if libc::setgid(self.gid) != 0
                 || libc::setuid(self.uid) != 0
                 || (self.uid != 0 && libc::setuid(0) == 0)
             {
                 libc::_exit(126);
+            }
+            // Output and errors into the user's own file, opened as the
+            // user, not into reclogind's log, where any line of the user's
+            // would carry reclogind's name. /dev/null when that fails.
+            for dir in &self.log_dirs {
+                libc::mkdir(dir.as_ptr(), 0o700);
+            }
+            let mut out = libc::open(
+                self.log_file.as_ptr(),
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | libc::O_TRUNC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NOCTTY
+                    | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            );
+            if out >= 0 {
+                libc::fchmod(out, 0o600);
+            } else {
+                out = libc::open(
+                    c"/dev/null".as_ptr(),
+                    libc::O_WRONLY | libc::O_NOCTTY | libc::O_CLOEXEC,
+                );
+            }
+            if out >= 0 {
+                libc::dup2(out, 1);
+                libc::dup2(out, 2);
+                if out > 2 {
+                    libc::close(out);
+                }
             }
             if libc::chdir(self.home.as_ptr()) != 0 {
                 libc::chdir(c"/".as_ptr());
@@ -571,8 +728,8 @@ fn wait_until_shown(console: u32, channel: &Channel) -> bool {
             return true;
         }
         match channel.wait_readable(50) {
-            Ok(true) => match channel.recv::<ToWorker>() {
-                Ok(Some((ToWorker::Cancel, _))) | Ok(None) | Err(_) => return false,
+            Ok(true) => match receive(channel) {
+                Ok(Some(Command::Cancel)) | Ok(None) | Err(_) => return false,
                 Ok(Some(_)) => {}
             },
             Ok(false) => {}
@@ -581,7 +738,8 @@ fn wait_until_shown(console: u32, channel: &Channel) -> bool {
     }
 }
 
-/// Wait until the desktop's process exits; end it when asked to.
+/// Wait until the desktop's process exits; end it when asked to. A lost
+/// `reclogind` is not a reason to end it (see `worker.rs`).
 fn wait_for_end(pid: libc::pid_t, channel: &Channel, signals: &OwnedFd) -> i32 {
     let mut channel_open = true;
     loop {
@@ -621,13 +779,12 @@ fn wait_for_end(pid: libc::pid_t, channel: &Channel, signals: &OwnedFd) -> i32 {
             }
         }
         if fds[1].revents != 0 {
-            match channel.recv::<ToWorker>() {
-                Ok(Some((ToWorker::Cancel, _))) => stop = true,
+            match receive(channel) {
+                Ok(Some(Command::Cancel)) => stop = true,
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
-                    log(WHO, "reclogind went away; ending the session");
+                    log(WHO, "reclogind went away; the session goes on");
                     channel_open = false;
-                    stop = true;
                 }
             }
         }
@@ -637,7 +794,7 @@ fn wait_for_end(pid: libc::pid_t, channel: &Channel, signals: &OwnedFd) -> i32 {
     }
 }
 
-fn reap(pid: libc::pid_t) -> Option<i32> {
+pub(crate) fn reap(pid: libc::pid_t) -> Option<i32> {
     let mut status = 0;
     let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
     if rc == pid {
@@ -651,7 +808,7 @@ fn reap(pid: libc::pid_t) -> Option<i32> {
 }
 
 /// End the desktop: its whole process group gets `SIGTERM`, then `SIGKILL`.
-fn end(pid: libc::pid_t) -> i32 {
+pub(crate) fn end(pid: libc::pid_t) -> i32 {
     unsafe {
         libc::kill(-pid, libc::SIGTERM);
     }
@@ -669,4 +826,114 @@ fn end(pid: libc::pid_t) -> i32 {
         libc::waitpid(pid, &mut status, 0);
         status
     }
+}
+
+/// Whether a `cancel` (or the loss of `reclogind`) is waiting on `channel`.
+fn cancel_waiting(channel: &Channel) -> bool {
+    while let Ok(true) = channel.wait_readable(0) {
+        match receive(channel) {
+            Ok(Some(Command::Cancel)) | Ok(None) | Err(_) => return true,
+            Ok(Some(other)) => log(WHO, format_args!("unexpected {} ignored", other.kind())),
+        }
+    }
+    false
+}
+
+/// The shell that runs the session: the user's, unless it is csh or tcsh
+/// (which do not take `-l -c`) or is not a program that exists; then
+/// `/bin/sh`.
+fn login_shell(shell: &str) -> &str {
+    let path = Path::new(shell);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let runnable = std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    if !shell.starts_with('/') || !runnable || matches!(name, "csh" | "tcsh") {
+        "/bin/sh"
+    } else {
+        shell
+    }
+}
+
+/// One word for the shell, in single quotes: nothing in it is expanded.
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// The words of a session file's `Exec`, by the Desktop Entry
+/// specification: first the escapes of every string value (`\s`, `\n`,
+/// `\t`, `\r`, `\\`), then the command line's own rules: words split at
+/// blanks, a word in double quotes may hold blanks and `\"`, `` \` ``,
+/// `\$`, `\\`; `%%` is `%`, and every field code (`%f`, `%U`, `%i`, ...)
+/// is dropped, as a session is started with no files or URLs. `None` when it
+/// cannot be read (an unclosed quote) or holds no word.
+fn exec_words(exec: &str) -> Option<Vec<String>> {
+    let mut value = String::with_capacity(exec.len());
+    let mut chars = exec.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            value.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('s') => value.push(' '),
+            Some('n') => value.push('\n'),
+            Some('t') => value.push('\t'),
+            Some('r') => value.push('\r'),
+            Some('\\') => value.push('\\'),
+            // Not a value escape: left for the command line's rules.
+            Some(other) => {
+                value.push('\\');
+                value.push(other);
+            }
+            None => value.push('\\'),
+        }
+    }
+
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\n' => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => match chars.next()? {
+                            c @ ('"' | '`' | '$' | '\\') => word.push(c),
+                            other => {
+                                word.push('\\');
+                                word.push(other);
+                            }
+                        },
+                        other => word.push(other),
+                    }
+                }
+            }
+            // Anything else after `%` is a field code: dropped (a word that
+            // was only one is gone).
+            '%' => {
+                if chars.next() == Some('%') {
+                    word.push('%');
+                    in_word = true;
+                }
+            }
+            other => {
+                word.push(other);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    (!words.is_empty()).then_some(words)
 }

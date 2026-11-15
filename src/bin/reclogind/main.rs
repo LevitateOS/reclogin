@@ -14,6 +14,7 @@ mod greeter;
 mod host;
 mod inputs;
 mod keyboard;
+mod last;
 mod login;
 mod pam;
 mod sandbox;
@@ -23,6 +24,7 @@ mod state;
 mod supervise;
 mod users;
 mod worker;
+mod xserver;
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -200,6 +202,7 @@ fn run(options: Options) -> Result<()> {
     }
     // Before the console is touched: a panic or a fatal signal still gives
     // it back.
+    supervise::handle_stray_signals();
     supervise::install_last_resort();
     // Block the signals first, so that a console switch during start-up waits
     // in the descriptor instead of killing us.
@@ -260,6 +263,10 @@ impl Daemon {
     fn serve(&mut self, signals: &OwnedFd) -> Result<()> {
         loop {
             self.login_check_greeter();
+            if let Next::Stop = self.tick() {
+                return Ok(());
+            }
+            let greeter_watched = !self.login.greeter_away();
             let mut fds = [
                 libc::pollfd {
                     fd: signals.as_raw_fd(),
@@ -269,12 +276,16 @@ impl Daemon {
                 libc::pollfd {
                     // While a session runs no greeter does: its closed socket
                     // is not watched (`login.rs`).
-                    fd: if self.login.greeter_away() {
-                        -1
-                    } else {
+                    fd: if greeter_watched {
                         self.greeter.channel.as_raw_fd()
+                    } else {
+                        -1
                     },
-                    events: libc::POLLIN,
+                    events: if self.greeter.wants_write() {
+                        libc::POLLIN | libc::POLLOUT
+                    } else {
+                        libc::POLLIN
+                    },
                     revents: 0,
                 },
                 libc::pollfd {
@@ -283,7 +294,8 @@ impl Daemon {
                     revents: 0,
                 },
             ];
-            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            let timeout = self.poll_timeout();
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
             if n < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {
@@ -303,16 +315,31 @@ impl Daemon {
             if self.supervisor.generation != generation {
                 continue;
             }
-            if fds[1].revents != 0 {
-                let gone = match self.greeter.channel.recv::<ToDaemon>() {
-                    Ok(Some((message, _))) => self.on_message(message),
-                    Ok(None) => self.greeter_gone("closed its socket"),
-                    Err(e) => {
-                        log(WHO, format_args!("from the greeter: {e}"));
-                        if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                            self.greeter_gone("hung up")
-                        } else {
-                            Next::Continue
+            if fds[1].revents & libc::POLLOUT != 0 {
+                if let Err(e) = self.greeter.flush() {
+                    log(WHO, format_args!("sending to the greeter: {e}"));
+                    if let Next::Stop = self.greeter_gone("could not be reached") {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
+            if fds[1].revents & !libc::POLLOUT != 0 {
+                let gone = if self.login.expects_raw_answer() {
+                    // The secret after `answer`, raw (`login.rs`).
+                    self.on_raw_answer()
+                } else {
+                    match self.greeter.channel.recv::<ToDaemon>() {
+                        Ok(Some((message, _))) => self.on_message(message),
+                        Ok(None) => self.greeter_gone("closed its socket"),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Next::Continue,
+                        Err(e) => {
+                            log(WHO, format_args!("from the greeter: {e}"));
+                            if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                                self.greeter_gone("hung up")
+                            } else {
+                                Next::Continue
+                            }
                         }
                     }
                 };
@@ -330,8 +357,10 @@ impl Daemon {
     }
 
     /// Send `message`; a greeter that cannot be reached is replaced.
+    /// Never waits: a message the socket cannot take now is queued
+    /// (`Greeter::send`), and a greeter that stops reading is hung (`tick`).
     fn send(&mut self, message: &ToGreeter) -> Next {
-        match self.greeter.channel.send(message, &[]) {
+        match self.greeter.send(message, &[]) {
             Ok(()) => Next::Continue,
             Err(e) => {
                 log(
@@ -346,11 +375,53 @@ impl Daemon {
         }
     }
 
+    /// The timed checks, on every turn of the loop: a hung greeter (its
+    /// queue stuck, a ping unanswered) is replaced and counted; a ping is
+    /// sent when due while the login console is shown; then the login's own
+    /// (`login.rs`).
+    fn tick(&mut self) -> Next {
+        let now = Instant::now();
+        if !self.login.greeter_away() {
+            if let Some(why) = self.greeter.hung(now) {
+                return self.greeter_gone(why);
+            }
+            if self.shown && !self.supervisor.handshake_pending {
+                if let Some(seq) = self.greeter.ping_due(now) {
+                    if let Next::Stop = self.send(&ToGreeter::Ping { seq }) {
+                        return Next::Stop;
+                    }
+                }
+            }
+        }
+        self.login_tick()
+    }
+
+    /// How long `poll` may wait: until the greeter's next check, or a
+    /// quarter second while the login has something timed; forever when
+    /// nothing is.
+    fn poll_timeout(&self) -> libc::c_int {
+        if self.login.wants_tick() {
+            return 250;
+        }
+        if self.login.greeter_away() {
+            return -1;
+        }
+        let pinging = self.shown && !self.supervisor.handshake_pending;
+        match self.greeter.next_deadline(pinging) {
+            Some(at) => {
+                let left = at.saturating_duration_since(Instant::now());
+                (left.as_millis().min(60_000) as libc::c_int).max(10)
+            }
+            None => -1,
+        }
+    }
+
     fn on_signal(&mut self, signal: i32) -> Next {
         match signal {
             console::RELEASE_SIGNAL => {
                 if self.shown {
                     self.shown = false;
+                    self.greeter.stop_pinging();
                     self.inputs.revoke_all();
                     self.display.give_up();
                     let _ = self.send(&ToGreeter::Pause);
@@ -381,10 +452,16 @@ impl Daemon {
                 }
                 Next::Continue
             }
-            libc::SIGCHLD => match self.greeter.child.try_wait() {
-                Ok(Some(_)) => self.greeter_gone("ended"),
-                _ => Next::Continue,
-            },
+            libc::SIGCHLD => {
+                // The session worker (`login.rs`), then the greeter.
+                if let Next::Stop = self.login_reap() {
+                    return Next::Stop;
+                }
+                match self.greeter.child.try_wait() {
+                    Ok(Some(_)) => self.greeter_gone("ended"),
+                    _ => Next::Continue,
+                }
+            }
             other => {
                 log(WHO, format_args!("stopping on signal {other}"));
                 Next::Stop
@@ -407,7 +484,6 @@ impl Daemon {
                 match opened {
                     Ok(fd) => match self
                         .greeter
-                        .channel
                         .send(&ToGreeter::Device { request_id }, &[fd.as_fd()])
                     {
                         Ok(()) => Next::Continue,
@@ -433,6 +509,10 @@ impl Daemon {
             | ToDaemon::Answer { .. }
             | ToDaemon::Cancel
             | ToDaemon::ChooseSession { .. }) => self.on_login_message(message),
+            ToDaemon::Pong { seq } => {
+                self.greeter.pong(seq);
+                Next::Continue
+            }
             ToDaemon::SwitchConsole { number } => {
                 // Ctrl+Alt+F1 to F12 only. A login in progress is not lost:
                 // PAM's conversation goes on in reclogind, and the greeter
@@ -444,9 +524,16 @@ impl Daemon {
                 }
                 Next::Continue
             }
-            other @ (ToDaemon::ReturnTo { .. }
-            | ToDaemon::Power { .. }
-            | ToDaemon::SetLayout { .. }) => {
+            // The layout picked on the screen lasts until the greeter is
+            // restarted; nothing is kept here (`keyboard.rs`).
+            ToDaemon::SetLayout { .. } => Next::Continue,
+            // Returning to a running session is stage 5: the screen shows
+            // this answer in place of its button.
+            ToDaemon::ReturnTo { .. } => self.send(&ToGreeter::AuthResult {
+                ok: false,
+                text: "Returning to a running session is not built yet.".into(),
+            }),
+            other @ ToDaemon::Power { .. } => {
                 log(
                     WHO,
                     format_args!(
@@ -466,7 +553,8 @@ impl Daemon {
         if let Ok(Some(_)) = self.greeter.child.try_wait() {
             return;
         }
-        let _ = self.greeter.channel.send(&ToGreeter::Quit, &[]);
+        let _ = self.greeter.send(&ToGreeter::Quit, &[]);
+        let _ = self.greeter.flush();
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if let Ok(Some(_)) = self.greeter.child.try_wait() {

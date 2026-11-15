@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use reclogin::protocol::{ToDaemon, ToGreeter, GREETER_SOCKET_ENV};
+use reclogin::protocol::{Secret, ToDaemon, ToGreeter, GREETER_SOCKET_ENV};
 use reclogin::wire::Channel;
 
 /// How long to wait for reclogind to answer a device request.
@@ -53,6 +53,13 @@ impl Link {
 
     pub fn send(&self, message: &ToDaemon) -> io::Result<()> {
         self.channel.send(message, &[])
+    }
+
+    /// Answer PAM's question `prompt_id`: `answer` announces it and the
+    /// secret follows as its own raw packet, never inside JSON.
+    pub fn send_answer(&self, prompt_id: u64, secret: &Secret) -> io::Result<()> {
+        self.channel.send(&ToDaemon::Answer { prompt_id }, &[])?;
+        self.channel.send_secret(secret)
     }
 
     fn recv(&self) -> Result<Incoming> {

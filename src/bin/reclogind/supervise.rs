@@ -20,8 +20,11 @@
 //!   early exit that skips the normal way out), the console goes back to
 //!   text mode with its keyboard. A panic hook and handlers for the fatal
 //!   signals restore it from numbers recorded when the console was taken
-//!   ([`arm_last_resort`]). SIGKILL cannot be caught: for that the systemd
-//!   unit runs `reclogind --reset-console 7` after reclogind has gone.
+//!   ([`arm_last_resort`]). Every other signal that would end it by default
+//!   gets a handler that does nothing ([`handle_stray_signals`]). SIGKILL
+//!   cannot be caught: for that both init services run
+//!   `reclogind --reset-console 7` after reclogind has gone (OpenRC through
+//!   `dist/openrc/reclogind-run`).
 
 use std::collections::VecDeque;
 use std::ffi::CString;
@@ -136,7 +139,6 @@ impl Supervisor {
         self.stopped = None;
         self.handshake_pending = false;
         let sent = greeter
-            .channel
             .send(
                 &ToGreeter::Hello {
                     version: VERSION,
@@ -146,7 +148,7 @@ impl Supervisor {
             )
             .and_then(|()| {
                 if shown {
-                    self.send_display_and_state(&greeter, display)
+                    self.send_display_and_state(&mut greeter, display)
                 } else {
                     self.handshake_pending = true;
                     Ok(())
@@ -161,7 +163,11 @@ impl Supervisor {
         Ok(greeter)
     }
 
-    fn send_display_and_state(&self, greeter: &Greeter, display: &Display) -> std::io::Result<()> {
+    fn send_display_and_state(
+        &self,
+        greeter: &mut Greeter,
+        display: &Display,
+    ) -> std::io::Result<()> {
         let state = crate::state::read(&self.config);
         log(
             WHO,
@@ -172,13 +178,13 @@ impl Supervisor {
                 state.current_layout
             ),
         );
-        greeter.channel.send(
+        greeter.send(
             &ToGreeter::Display {
                 path: display.path.clone(),
             },
             &[display.as_fd()],
         )?;
-        greeter.channel.send(&ToGreeter::State(state), &[])
+        greeter.send(&ToGreeter::State(state), &[])
     }
 
     /// Start greeters until one is up, counting each one that is not.
@@ -232,9 +238,10 @@ impl Daemon {
         self.supervisor.handshake_pending = false;
         match self
             .supervisor
-            .send_display_and_state(&self.greeter, &self.display)
+            .send_display_and_state(&mut self.greeter, &self.display)
         {
-            Ok(()) => Next::Continue,
+            // A line kept for the screen (`login.rs`) goes after the state.
+            Ok(()) => self.login_after_handshake(),
             Err(e) => self.greeter_gone(&format!("could not be reached: {e}")),
         }
     }
@@ -362,6 +369,45 @@ extern "C" fn on_fatal_signal(signal: libc::c_int) {
     unsafe {
         libc::signal(signal, libc::SIG_DFL);
         libc::raise(signal);
+    }
+}
+
+extern "C" fn on_stray_signal(_signal: libc::c_int) {}
+
+/// Give every signal whose default action ends the process, and that
+/// nothing else handles, a handler that does nothing: SIGALRM, SIGVTALRM,
+/// SIGPROF, SIGIO (SIGPOLL), SIGPWR, SIGSTKFLT and the real-time signals.
+/// None of them may end reclogind (or a session worker) without the console
+/// being given back. A handler, not "ignore": exec resets handlers but keeps
+/// ignored signals, and the greeter, the X server and the desktop must start
+/// with the defaults. SIGUSR1 and SIGUSR2 (console switching) and SIGTERM,
+/// SIGINT, SIGHUP, SIGCHLD are blocked and read from a signal descriptor;
+/// they get the same handler for the moment before they are blocked.
+/// SIGINT also loses an inherited "ignore" (a shell starts background
+/// commands with it), so that a forwarded SIGINT reaches the descriptor.
+pub fn handle_stray_signals() {
+    let mut signals = vec![
+        libc::SIGALRM,
+        libc::SIGVTALRM,
+        libc::SIGPROF,
+        libc::SIGIO,
+        libc::SIGPWR,
+        libc::SIGSTKFLT,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+        libc::SIGINT,
+        libc::SIGHUP,
+        libc::SIGTERM,
+    ];
+    signals.extend(libc::SIGRTMIN()..=libc::SIGRTMAX());
+    for signal in signals {
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_stray_signal as extern "C" fn(libc::c_int) as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
     }
 }
 

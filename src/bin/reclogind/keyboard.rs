@@ -1,16 +1,24 @@
 //! The keyboard layouts the system is set to.
 //!
 //! Both OSes keep the desktop keyboard in `/etc/X11/xorg.conf.d/` (the
-//! installer writes `00-keyboard.conf`; `localectl` writes the same file):
-//! `Option "XkbLayout" "us,de"`, `"XkbVariant"`, `"XkbModel"`,
-//! `"XkbOptions"`. Without it the layout is `us`. The names shown come from
-//! xkeyboard-config's rules file.
+//! installer's `x11-keyboard` command writes `00-keyboard.conf` on both;
+//! `localectl` writes the same file): `Option "XkbLayout" "us,de"`,
+//! `"XkbVariant"`, `"XkbModel"`, `"XkbOptions"`. When that gives no layout,
+//! `/etc/vconsole.conf`'s `XKBLAYOUT`, `XKBVARIANT`, `XKBMODEL` and
+//! `XKBOPTIONS` are used (systemd's own place for it, so LevitateOS only).
+//! Without either the layout is `us`. The installer's `keymap` command
+//! writes a console keymap name (`KEYMAP=` in `/etc/vconsole.conf`, or
+//! `keymap=` in `/etc/conf.d/loadkeys` on OpenRC), which is not an XKB
+//! layout and is not read. The names shown come from xkeyboard-config's
+//! rules file. Nothing is remembered: the layout picked on the login screen
+//! lasts until the greeter is restarted.
 
 use std::path::Path;
 
 use reclogin::protocol::Layout;
 
 pub const XORG_CONF_DIR: &str = "/etc/X11/xorg.conf.d";
+pub const VCONSOLE_CONF: &str = "/etc/vconsole.conf";
 pub const RULES_XML: &str = "/usr/share/X11/xkb/rules/evdev.xml";
 
 #[derive(Default)]
@@ -21,8 +29,11 @@ struct Setting {
     options: String,
 }
 
-pub fn configured(conf_dir: &Path, rules_xml: &Path) -> Vec<Layout> {
-    let setting = read_setting(conf_dir);
+pub fn configured(conf_dir: &Path, vconsole: &Path, rules_xml: &Path) -> Vec<Layout> {
+    let mut setting = read_setting(conf_dir);
+    if setting.layout.trim().is_empty() {
+        setting = read_vconsole(vconsole);
+    }
     let rules = std::fs::read_to_string(rules_xml).unwrap_or_default();
     let layouts: Vec<&str> = setting.layout.split(',').map(str::trim).collect();
     let variants: Vec<&str> = setting.variant.split(',').map(str::trim).collect();
@@ -89,6 +100,30 @@ fn read_setting(conf_dir: &Path) -> Setting {
                 _ => continue,
             };
             *slot = value.to_string();
+        }
+    }
+    setting
+}
+
+/// `XKBLAYOUT="de"` and its three siblings, as `/etc/vconsole.conf` has them
+/// (shell-style assignments, quotes optional).
+fn read_vconsole(path: &Path) -> Setting {
+    let mut setting = Setting::default();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return setting;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']).to_string();
+        match key.trim() {
+            "XKBLAYOUT" => setting.layout = value,
+            "XKBVARIANT" => setting.variant = value,
+            "XKBMODEL" => setting.model = value,
+            "XKBOPTIONS" => setting.options = value,
+            _ => {}
         }
     }
     setting
