@@ -92,3 +92,14 @@ pub const CAPS: Icon = Icon {
     shapes: &[Path("M12 4 4.5 12H9v4h6v-4h4.5L12 4Z"), Path("M9 19.5h6")],
     stroke: 1.8,
 };
+
+/// The tick before a step reclogind confirms ("Current password accepted.").
+pub const CHECK: Icon = Icon {
+    shapes: &[Path("m5 12.5 4.5 4.5L19 7.5")],
+    stroke: 2.0,
+};
+
+pub const CHEVRON_LEFT: Icon = Icon {
+    shapes: &[Path("m15 6-6 6 6 6")],
+    stroke: 2.0,
+};

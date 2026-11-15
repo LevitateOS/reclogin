@@ -1,0 +1,38 @@
+# reclogin: the login screen, on console 7 (LevitateOS, systemd).
+#
+# Text logins stay on consoles 1 to 6. reclogind restarts a crashed greeter
+# itself; after three failures within a minute it exits with status 3, and
+# systemd does not start it again, so the machine stays on its text logins.
+# A reclogind that fails in another way is started again at most twice
+# within a minute (StartLimit*), never endlessly.
+
+[Unit]
+Description=reclogin login screen
+After=systemd-user-sessions.service systemd-logind.service dbus.service
+After=getty@tty7.service plymouth-quit.service
+Wants=dbus.service
+Conflicts=getty@tty7.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/reclogind
+# However reclogind ended (even SIGKILL): if console 7 is still in graphics
+# mode, give it back and show console 1. Does nothing after a clean stop.
+ExecStopPost=-/usr/bin/reclogind --reset-console 7
+Restart=on-failure
+RestartSec=1
+# 2: bad arguments, 3: gave up after three greeter failures. Neither gets
+# better by starting again.
+RestartPreventExitStatus=2 3
+# SIGTERM to reclogind only: it tells the greeter to quit itself. Sending it
+# to the greeter as well would look like a crash and start a new one.
+KillMode=mixed
+TimeoutStopSec=10
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+Alias=display-manager.service

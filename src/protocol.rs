@@ -121,6 +121,9 @@ pub enum PromptKind {
 pub enum MessageKind {
     Info,
     Error,
+    /// A step reclogind confirms in its own words, never PAM's: "Current
+    /// password accepted." before an expired password is changed.
+    Success,
 }
 
 /// What the login screen shows that comes from the system.

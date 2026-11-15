@@ -1,14 +1,12 @@
 //! reclogind: the root half of reclogin.
 //!
 //! It owns the login console and the display, opens input devices for the
-//! greeter, and starts the greeter with no rights. Later stages add, each in
-//! its own module: `pam` (the PAM conversation), `session` (starting and
-//! ending a desktop), `xserver` (X sessions), `logind` (who is logged in,
-//! power, bringing a session to the front), `guest`, `autologin`, and
-//! restarting a crashed greeter.
-//!
-//! Stage 1 answers a login attempt with a message that logging in is not
-//! built yet.
+//! greeter, and starts the greeter with no rights. Logging in is `login`
+//! (one login at a time), done by a session worker per login (`worker`,
+//! `reclogind --session-worker`) that owns the PAM handle (`pam`) and the
+//! session (`session`). Later stages add, each in its own module: `xserver`
+//! (X sessions), `logind` (who is logged in, power, bringing a session to
+//! the front), `guest`, `autologin`.
 
 mod console;
 mod display;
@@ -16,9 +14,15 @@ mod greeter;
 mod host;
 mod inputs;
 mod keyboard;
+mod login;
+mod pam;
+mod sandbox;
+mod session;
 mod sessions;
 mod state;
+mod supervise;
 mod users;
+mod worker;
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -28,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use reclogin::config::{self, Config};
-use reclogin::protocol::{MessageKind, ToDaemon, ToGreeter, VERSION};
+use reclogin::protocol::{ToDaemon, ToGreeter};
 use reclogin::{brand, log};
 
 use console::Console;
@@ -37,7 +41,6 @@ use greeter::Greeter;
 use inputs::Inputs;
 
 const WHO: &str = "reclogind";
-const NOT_BUILT: &str = "Logging in is not built yet.";
 
 struct Options {
     console: u32,
@@ -45,16 +48,26 @@ struct Options {
     greeter_user: String,
     config: PathBuf,
     brand_dir: PathBuf,
+    /// The greeter's lock-down (`sandbox.rs`); off with `--no-sandbox`.
+    sandbox: bool,
 }
 
 const USAGE: &str = "usage: reclogind [--console N] [--greeter PATH] [--greeter-user NAME]
-                 [--config FILE] [--brand-dir DIR]
+                 [--config FILE] [--brand-dir DIR] [--no-sandbox]
+       reclogind --reset-console N
 
 Runs the login screen on console N (default 7). Must run as root.
   --greeter PATH       the greeter program (default: reclogin-greeter next to reclogind)
   --greeter-user NAME  the account the greeter runs as (default: reclogin)
   --config FILE        settings (default: /etc/reclogin.conf)
-  --brand-dir DIR      brand data for the greeter (default: /usr/share/reclogin)";
+  --brand-dir DIR      brand data for the greeter (default: /usr/share/reclogin)
+  --no-sandbox         development: start the greeter without its lock-down
+                       (network namespace, limits, capabilities, Landlock)
+  --reset-console N    for the init system after reclogind has gone: if console N
+                       is still in graphics mode, give it back and show console 1
+
+Exit status: 0 stopped on request, 1 an error, 2 bad arguments, 3 gave up
+after the greeter failed three times within a minute.";
 
 fn options() -> Result<Option<Options>> {
     let own = std::env::current_exe().context("finding reclogind's own path")?;
@@ -64,6 +77,7 @@ fn options() -> Result<Option<Options>> {
         greeter_user: "reclogin".into(),
         config: PathBuf::from(config::DEFAULT_PATH),
         brand_dir: PathBuf::from(brand::DEFAULT_DIR),
+        sandbox: true,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -76,6 +90,7 @@ fn options() -> Result<Option<Options>> {
             "--greeter-user" => options.greeter_user = value()?,
             "--config" => options.config = value()?.into(),
             "--brand-dir" => options.brand_dir = value()?.into(),
+            "--no-sandbox" => options.sandbox = false,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(None);
@@ -91,6 +106,13 @@ fn options() -> Result<Option<Options>> {
 }
 
 fn main() -> ExitCode {
+    // Started by reclogind itself for one login (`login.rs`); not in USAGE.
+    if std::env::args().nth(1).as_deref() == Some(worker::SWITCH) {
+        return worker::run();
+    }
+    if let Some(code) = supervise::reset_console_mode() {
+        return code;
+    }
     let options = match options() {
         Ok(Some(options)) => options,
         Ok(None) => return ExitCode::SUCCESS,
@@ -161,6 +183,10 @@ struct Daemon {
     greeter: Greeter,
     /// Whether the login console is shown (and the display and inputs ours).
     shown: bool,
+    /// Restarting the greeter, and giving up (`supervise.rs`).
+    supervisor: supervise::Supervisor,
+    /// The login under way and its session (`login.rs`).
+    login: login::Login,
 }
 
 enum Next {
@@ -172,6 +198,9 @@ fn run(options: Options) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("reclogind must run as root");
     }
+    // Before the console is touched: a panic or a fatal signal still gives
+    // it back.
+    supervise::install_last_resort();
     // Block the signals first, so that a console switch during start-up waits
     // in the descriptor instead of killing us.
     let signals = signal_fd().context("setting up signals")?;
@@ -180,56 +209,48 @@ fn run(options: Options) -> Result<()> {
         log(WHO, problem);
     }
 
-    let console = Console::take(options.console)?;
+    // Every early return below drops `console`, which gives it back.
+    let mut console = Console::take(options.console)?;
     let display = Display::open()?;
     display
         .take()
         .with_context(|| format!("becoming the master of {}", display.path))?;
     log(WHO, format_args!("display {}", display.path));
-    let greeter = greeter::start(&options.greeter, &options.greeter_user)?;
+    greeter::configure(greeter::Settings {
+        brand_dir: options.brand_dir.clone(),
+        sandbox: options.sandbox,
+    });
+    let mut supervisor = supervise::Supervisor::new(
+        options.greeter.clone(),
+        options.greeter_user.clone(),
+        options.brand_dir.clone(),
+        loaded.config.clone(),
+    );
+    let mut inputs = Inputs::default();
+    // Started, sent hello, the display and the state; a greeter that cannot
+    // be started counts as a failure like one that crashes.
+    let greeter = match supervisor.launch_until_up(&display, true) {
+        Ok(greeter) => greeter,
+        Err(reason) => supervise::give_up(
+            &mut console,
+            &display,
+            &mut inputs,
+            &reason,
+            supervisor.missing(),
+        ),
+    };
     let mut daemon = Daemon {
         console,
         display,
-        inputs: Inputs::default(),
+        inputs,
         greeter,
         shown: true,
+        supervisor,
+        login: login::Login::default(),
     };
 
-    let state = state::read(&loaded.config);
-    log(
-        WHO,
-        format_args!(
-            "{} users, {} sessions, layout {}",
-            state.users.len(),
-            state.sessions.len(),
-            state.current_layout
-        ),
-    );
-    let started = (|| -> io::Result<()> {
-        let channel = &daemon.greeter.channel;
-        channel.send(
-            &ToGreeter::Hello {
-                version: VERSION,
-                brand_dir: options.brand_dir.clone(),
-            },
-            &[],
-        )?;
-        channel.send(
-            &ToGreeter::Display {
-                path: daemon.display.path.clone(),
-            },
-            &[daemon.display.as_fd()],
-        )?;
-        channel.send(&ToGreeter::State(state), &[])
-    })();
-    if let Err(e) = started {
-        log(WHO, format_args!("talking to the greeter: {e}"));
-        daemon.stop_greeter();
-        daemon.give_back();
-        return Err(e).context("starting the greeter");
-    }
-
     let result = daemon.serve(&signals);
+    daemon.end_login();
     daemon.stop_greeter();
     daemon.give_back();
     result
@@ -238,6 +259,7 @@ fn run(options: Options) -> Result<()> {
 impl Daemon {
     fn serve(&mut self, signals: &OwnedFd) -> Result<()> {
         loop {
+            self.login_check_greeter();
             let mut fds = [
                 libc::pollfd {
                     fd: signals.as_raw_fd(),
@@ -245,7 +267,18 @@ impl Daemon {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: self.greeter.channel.as_raw_fd(),
+                    // While a session runs no greeter does: its closed socket
+                    // is not watched (`login.rs`).
+                    fd: if self.login.greeter_away() {
+                        -1
+                    } else {
+                        self.greeter.channel.as_raw_fd()
+                    },
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.login.fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 },
@@ -258,6 +291,7 @@ impl Daemon {
                 }
                 return Err(error).context("waiting");
             }
+            let generation = self.supervisor.generation;
             if fds[0].revents != 0 {
                 while let Some(signal) = next_signal(signals) {
                     if let Next::Stop = self.on_signal(signal) {
@@ -265,29 +299,38 @@ impl Daemon {
                     }
                 }
             }
+            // A new greeter was started: `fds[1]` was about the old socket.
+            if self.supervisor.generation != generation {
+                continue;
+            }
             if fds[1].revents != 0 {
-                match self.greeter.channel.recv::<ToDaemon>() {
-                    Ok(Some((message, _))) => {
-                        if let Next::Stop = self.on_message(message) {
-                            return Ok(());
-                        }
-                    }
-                    Ok(None) => {
-                        log(WHO, "the greeter closed its socket");
-                        return Ok(());
-                    }
+                let gone = match self.greeter.channel.recv::<ToDaemon>() {
+                    Ok(Some((message, _))) => self.on_message(message),
+                    Ok(None) => self.greeter_gone("closed its socket"),
                     Err(e) => {
                         log(WHO, format_args!("from the greeter: {e}"));
                         if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                            return Ok(());
+                            self.greeter_gone("hung up")
+                        } else {
+                            Next::Continue
                         }
                     }
+                };
+                if let Next::Stop = gone {
+                    return Ok(());
+                }
+            }
+            // The session worker of the login under way (`login.rs`).
+            if fds[2].revents != 0 {
+                if let Next::Stop = self.on_worker() {
+                    return Ok(());
                 }
             }
         }
     }
 
-    fn send(&self, message: &ToGreeter) -> Next {
+    /// Send `message`; a greeter that cannot be reached is replaced.
+    fn send(&mut self, message: &ToGreeter) -> Next {
         match self.greeter.channel.send(message, &[]) {
             Ok(()) => Next::Continue,
             Err(e) => {
@@ -298,7 +341,7 @@ impl Daemon {
                         reclogin::protocol::Framed::kind(message)
                     ),
                 );
-                Next::Stop
+                self.greeter_gone("could not be reached")
             }
         }
     }
@@ -321,20 +364,25 @@ impl Daemon {
                 if let Err(e) = self.console.acknowledge_acquire() {
                     log(WHO, format_args!("taking the console back: {e}"));
                 }
+                // A session is starting or runs: its console comes back.
+                if let Some(next) = self.login_on_acquire() {
+                    return next;
+                }
                 if !self.shown {
                     self.shown = true;
                     if let Err(e) = self.display.take() {
                         log(WHO, format_args!("taking the display back: {e}"));
+                    }
+                    if self.supervisor.handshake_pending {
+                        // Started while the console was not shown.
+                        return self.finish_handshake();
                     }
                     return self.send(&ToGreeter::Resume);
                 }
                 Next::Continue
             }
             libc::SIGCHLD => match self.greeter.child.try_wait() {
-                Ok(Some(status)) => {
-                    log(WHO, format_args!("the greeter ended: {status}"));
-                    Next::Stop
-                }
+                Ok(Some(_)) => self.greeter_gone("ended"),
                 _ => Next::Continue,
             },
             other => {
@@ -365,7 +413,7 @@ impl Daemon {
                         Ok(()) => Next::Continue,
                         Err(e) => {
                             log(WHO, format_args!("sending a device to the greeter: {e}"));
-                            Next::Stop
+                            self.greeter_gone("could not be reached")
                         }
                     },
                     Err(reason) => {
@@ -381,30 +429,22 @@ impl Daemon {
                 self.inputs.close(request_id);
                 Next::Continue
             }
-            ToDaemon::Begin { .. } | ToDaemon::Answer { .. } => {
-                // An Answer's secret is overwritten as `message` is dropped here.
-                if let Next::Stop = self.send(&ToGreeter::Message {
-                    kind: MessageKind::Error,
-                    text: NOT_BUILT.into(),
-                }) {
-                    return Next::Stop;
-                }
-                self.send(&ToGreeter::AuthResult {
-                    ok: false,
-                    text: String::new(),
-                })
-            }
+            message @ (ToDaemon::Begin { .. }
+            | ToDaemon::Answer { .. }
+            | ToDaemon::Cancel
+            | ToDaemon::ChooseSession { .. }) => self.on_login_message(message),
             ToDaemon::SwitchConsole { number } => {
-                if (1..=63).contains(&number) && number != self.console.number {
+                // Ctrl+Alt+F1 to F12 only. A login in progress is not lost:
+                // PAM's conversation goes on in reclogind, and the greeter
+                // clears a half-typed field on `pause` and says so.
+                if (1..=12).contains(&number) && number != self.console.number {
                     if let Err(e) = self.console.switch_to(number) {
                         log(WHO, format_args!("switching to console {number}: {e}"));
                     }
                 }
                 Next::Continue
             }
-            other @ (ToDaemon::Cancel
-            | ToDaemon::ChooseSession { .. }
-            | ToDaemon::ReturnTo { .. }
+            other @ (ToDaemon::ReturnTo { .. }
             | ToDaemon::Power { .. }
             | ToDaemon::SetLayout { .. }) => {
                 log(
@@ -419,8 +459,10 @@ impl Daemon {
         }
     }
 
-    /// Ask the greeter to quit, then make sure it has.
+    /// Ask the greeter to quit, then make sure it has. Its exit is expected:
+    /// it is not counted as a failure and no new greeter is started.
     fn stop_greeter(&mut self) {
+        self.supervisor.stopping(self.greeter.child.id());
         if let Ok(Some(_)) = self.greeter.child.try_wait() {
             return;
         }

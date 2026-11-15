@@ -2,7 +2,7 @@
 //! `Acorn.dc.html`). Every position and size below is the design's, in
 //! 1920×1080 units; colours and names come from the brand and the state.
 
-use reclogin::protocol::{MessageKind, PowerAction, State};
+use reclogin::protocol::{MessageKind, PowerAction, PromptKind, State};
 
 use super::{Clock, Target};
 use crate::form::{Focus, Form};
@@ -11,23 +11,23 @@ use crate::paint::text::{Face, Style};
 use crate::paint::Painter;
 
 /// The content box inside the frame art.
-const LEFT: f32 = 250.0;
-const TOP: f32 = 140.0;
+pub(super) const LEFT: f32 = 250.0;
+pub(super) const TOP: f32 = 140.0;
 const WIDTH: f32 = 1420.0;
-const HEIGHT: f32 = 800.0;
+pub(super) const HEIGHT: f32 = 800.0;
 const RIGHT: f32 = LEFT + WIDTH;
 const BOTTOM: f32 = TOP + HEIGHT;
 
 /// The user list column and the column right of it.
-const LIST_W: f32 = 420.0;
+pub(super) const LIST_W: f32 = 420.0;
 const COLUMN_GAP: f32 = 110.0;
-const FORM_X: f32 = LEFT + LIST_W + COLUMN_GAP;
-const FORM_W: f32 = WIDTH - LIST_W - COLUMN_GAP;
+pub(super) const FORM_X: f32 = LEFT + LIST_W + COLUMN_GAP;
+pub(super) const FORM_W: f32 = WIDTH - LIST_W - COLUMN_GAP;
 
-const ROW_H: f32 = 68.0;
-const FIELD_W: f32 = 560.0;
-const FIELD_H: f32 = 60.0;
-const FOOTER_H: f32 = 1.0 + 22.0 + 44.0;
+pub(super) const ROW_H: f32 = 68.0;
+pub(super) const FIELD_W: f32 = 560.0;
+pub(super) const FIELD_H: f32 = 60.0;
+pub(super) const FOOTER_H: f32 = 1.0 + 22.0 + 44.0;
 
 pub struct View<'a> {
     pub state: &'a State,
@@ -170,22 +170,8 @@ pub fn draw(p: &mut Painter, v: &View) {
                 p.text(text, sans(13.0, pal.text_muted), FORM_X, y);
             }
             Line::Notice(kind, text) => {
-                let color = match kind {
-                    MessageKind::Error => pal.bad,
-                    MessageKind::Info => pal.ok,
-                };
-                notice_line(
-                    p,
-                    text,
-                    color,
-                    if *kind == MessageKind::Error {
-                        Some(&icons::ALERT)
-                    } else {
-                        None
-                    },
-                    y,
-                    h,
-                );
+                let (color, icon) = message_look(p, *kind);
+                notice_line(p, text, color, icon, y, h);
             }
             Line::Caps => notice_line(p, "Caps Lock is on.", pal.warn, Some(&icons::CAPS), y, h),
         }
@@ -268,11 +254,41 @@ enum Line {
     Caps,
 }
 
-/// The lines under the password field: the message and the Caps Lock
-/// warning when there are any (as in the wrong-password design), otherwise
-/// the layout hint.
+/// The colour and icon of a message: an error in the error style with the
+/// alert sign, reclogind's confirmation with a tick, PAM's information in
+/// the secondary text colour.
+pub(super) fn message_look(
+    p: &Painter,
+    kind: MessageKind,
+) -> (reclogin::brand::Rgb, Option<&'static Icon>) {
+    let pal = p.palette();
+    match kind {
+        MessageKind::Error => (pal.bad, Some(&icons::ALERT)),
+        MessageKind::Success => (pal.ok, Some(&icons::CHECK)),
+        MessageKind::Info => (pal.text_secondary, None),
+    }
+}
+
+/// Whether the field shows a failure (its border in the error colour).
+pub(super) fn failed(form: &Form) -> bool {
+    matches!(form.notice, Some((MessageKind::Error, _)))
+        || form
+            .talk
+            .messages
+            .iter()
+            .any(|(kind, _)| *kind == MessageKind::Error)
+}
+
+/// The lines under the password field: PAM's messages of the last attempt,
+/// the error line and the Caps Lock warning when there are any (as in the
+/// wrong-password design), otherwise the layout hint.
 fn form_lines(v: &View) -> Vec<Line> {
     let mut lines = Vec::new();
+    for (kind, text) in &v.form.talk.messages {
+        for part in text.lines().filter(|l| !l.trim().is_empty()) {
+            lines.push(Line::Notice(*kind, part.to_string()));
+        }
+    }
     if let Some((kind, text)) = &v.form.notice {
         for part in text.lines().filter(|l| !l.trim().is_empty()) {
             lines.push(Line::Notice(*kind, part.to_string()));
@@ -290,7 +306,7 @@ fn form_lines(v: &View) -> Vec<Line> {
     lines
 }
 
-fn layout_label(state: &State) -> String {
+pub(super) fn layout_label(state: &State) -> String {
     state
         .layouts
         .iter()
@@ -299,7 +315,7 @@ fn layout_label(state: &State) -> String {
         .unwrap_or_else(|| state.current_layout.clone())
 }
 
-fn header_height(p: &Painter) -> f32 {
+pub(super) fn header_height(p: &Painter) -> f32 {
     let pal = p.palette();
     let left = p
         .line_height(&Style::new(Face::Serif, 30.0, pal.text))
@@ -312,7 +328,7 @@ fn header_height(p: &Painter) -> f32 {
     left.max(right)
 }
 
-fn header(p: &mut Painter, v: &View, _height: f32) {
+pub(super) fn header(p: &mut Painter, v: &View, _height: f32) {
     let pal = p.palette();
     let name_style = Style::new(Face::Serif, 30.0, pal.text).tracking(-0.02);
     let row_h = p.line_height(&name_style).max(34.0);
@@ -382,7 +398,7 @@ fn name_text_at(p: &mut Painter, name: &str, center: f32, color: reclogin::brand
     p.put(&laid, LEFT + 98.0, center - laid.height / 2.0);
 }
 
-fn user_row(
+pub(super) fn user_row(
     p: &mut Painter,
     top: f32,
     index: usize,
@@ -439,10 +455,14 @@ fn user_row(
     p.rule_h(LEFT, top + ROW_H - 1.0, LIST_W, 1.0, pal.rule);
 }
 
-fn password_field(p: &mut Painter, v: &View, top: f32) {
+/// The field being typed into, its top at `top`: the login password, or
+/// the answer to PAM's question (a visible question shows its text plainly
+/// and has no show-password button).
+pub(super) fn password_field(p: &mut Painter, v: &View, top: f32) {
     let pal = p.palette();
     let focused = v.form.focus == Focus::Password;
-    let failed = matches!(v.form.notice, Some((MessageKind::Error, _)));
+    let failed = failed(v.form);
+    let visible = matches!(v.form.talk.asking, Some((_, PromptKind::Visible)));
     p.fill_rect(FORM_X, top, FIELD_W, FIELD_H, pal.surface_sunken);
     let (border_w, border_c) = if failed {
         (2.0, pal.bad)
@@ -453,11 +473,12 @@ fn password_field(p: &mut Painter, v: &View, top: f32) {
     };
     p.border(FORM_X, top, FIELD_W, FIELD_H, border_w, border_c);
 
-    let text_room = FIELD_W - FIELD_H;
+    let text_room = if visible { FIELD_W } else { FIELD_W - FIELD_H };
     let style = Style::new(Face::Sans, 22.0, pal.text).tracking(0.2);
     let count = v.form.password.chars().count();
-    let laid = if v.form.show_password {
-        // The person asked to see it; this copy is not overwritten after use.
+    let laid = if v.form.show_password || visible {
+        // The person asked to see it (or PAM's question shows what is
+        // typed); this copy is not overwritten after use.
         p.lay(&[(v.form.password.as_str(), style)], None, false)
     } else {
         let dots = "•".repeat(count);
@@ -483,6 +504,9 @@ fn password_field(p: &mut Painter, v: &View, top: f32) {
         p.fill_rect(caret_x, top + (FIELD_H - 28.0) / 2.0, 2.0, 28.0, pal.text);
     }
     p.hit(FORM_X, top, text_room, FIELD_H, Target::Password);
+    if visible {
+        return;
+    }
 
     let button_x = FORM_X + text_room;
     p.rule_v(
@@ -507,7 +531,7 @@ fn password_field(p: &mut Painter, v: &View, top: f32) {
     p.hit(button_x, top, FIELD_H, FIELD_H, Target::ShowPassword);
 }
 
-fn notice_line(
+pub(super) fn notice_line(
     p: &mut Painter,
     text: &str,
     color: reclogin::brand::Rgb,
@@ -528,7 +552,7 @@ fn notice_line(
     p.put(&laid, x, top + (height - laid.height).max(0.0) / 2.0);
 }
 
-fn footer(p: &mut Painter, v: &View) {
+pub(super) fn footer(p: &mut Painter, v: &View) {
     let pal = p.palette();
     let top = BOTTOM - FOOTER_H;
     p.rule_h(LEFT, top, WIDTH, 1.0, pal.rule);

@@ -3,12 +3,27 @@
 //! that already holds the brand and the frame's size, and returns nothing
 //! but the areas a pointer may hit. No screen touches a device.
 //!
-//! Stage 1 has the normal login screen. Later stages add the others of the
-//! design canvas (wrong password, expired password, other user, no users,
-//! guest, returning to a session, shutting down, the on-screen keyboard,
-//! the second monitor, the text-login fallback) beside it.
+//! The normal login screen ([`login`]) also draws a failed attempt (the
+//! wrong-password design): PAM's messages and the error line under the
+//! field. While PAM asks further questions (an expired password) the
+//! [`conversation`] screen is drawn instead. Later stages add the others of
+//! the design canvas (other user, no users, guest, returning to a session,
+//! shutting down, the on-screen keyboard, the second monitor, the
+//! text-login fallback) beside them.
 
+pub mod conversation;
 pub mod login;
+
+use crate::paint::Painter;
+
+/// Draw the screen the form is on.
+pub fn draw(p: &mut Painter, v: &login::View) {
+    if v.form.talking() {
+        conversation::draw(p, v);
+    } else {
+        login::draw(p, v);
+    }
+}
 
 use chrono::{DateTime, Datelike, Local, Timelike};
 use reclogin::protocol::PowerAction;
@@ -22,6 +37,8 @@ pub enum Target {
     Password,
     ShowPassword,
     LogIn,
+    /// "Cancel" and "Someone else" while PAM asks further questions.
+    Cancel,
     Session,
     Layout,
     OnScreenKeyboard,

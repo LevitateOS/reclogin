@@ -9,12 +9,15 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{bail, Context, Result};
 use reclogin::log;
 
+const KDGETMODE: libc::c_ulong = 0x4B3B;
+pub const K_XLATE: libc::c_int = 1;
+pub const K_UNICODE: libc::c_int = 3;
 const VT_SETMODE: libc::c_ulong = 0x5602;
 const VT_GETSTATE: libc::c_ulong = 0x5603;
 const VT_RELDISP: libc::c_ulong = 0x5605;
@@ -109,6 +112,14 @@ impl Console {
             keyboard_mode,
             restored: false,
         };
+        // Before anything changes: whatever ends reclogind from here on, the
+        // last resort gives the console back (`supervise.rs`).
+        crate::supervise::arm_last_resort(
+            console.tty.as_raw_fd(),
+            console.tty0.as_raw_fd(),
+            keyboard_mode,
+            console.previous,
+        );
 
         let mode = VtMode {
             mode: VT_PROCESS,
@@ -161,6 +172,7 @@ impl Console {
             return;
         }
         self.restored = true;
+        crate::supervise::disarm_last_resort();
         let step = |what: &str, result: io::Result<()>| {
             if let Err(e) = result {
                 log(
@@ -200,4 +212,34 @@ impl Drop for Console {
     fn drop(&mut self) {
         self.restore();
     }
+}
+
+/// The last resort, for a panic, a fatal signal or `--reset-console`: the
+/// steps of [`Console::restore`] from plain numbers, each tried, without
+/// waiting for the switch. Only system calls, so safe in a signal handler.
+pub fn restore_raw(tty: RawFd, tty0: RawFd, keyboard_mode: libc::c_int, show: u32) {
+    let mode = VtMode {
+        mode: VT_AUTO,
+        waitv: 0,
+        relsig: 0,
+        acqsig: 0,
+        frsig: 0,
+    };
+    unsafe {
+        libc::ioctl(tty, VT_SETMODE as _, &mode);
+        libc::ioctl(tty, KDSKBMODE as _, keyboard_mode as libc::c_long);
+        libc::ioctl(tty, KDSETMODE as _, KD_TEXT as libc::c_long);
+        if show != 0 {
+            libc::ioctl(tty0, VT_ACTIVATE as _, show as libc::c_long);
+        }
+    }
+}
+
+/// Whether the console open as `tty` is in graphics mode.
+pub fn graphics_mode(tty: RawFd) -> io::Result<bool> {
+    let mut mode: libc::c_int = 0;
+    if unsafe { libc::ioctl(tty, KDGETMODE as _, &mut mode) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(mode == KD_GRAPHICS)
 }

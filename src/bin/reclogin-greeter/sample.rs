@@ -1,17 +1,50 @@
 //! `--render-png`: one frame of the login screen to a PNG file, for
 //! development. Opens no device and no socket.
+//!
+//! A `--state` file is a [`State`] in JSON. It may also carry a `"sample"`
+//! object (ignored by everything else) that puts the form in a state PAM
+//! would leave it in: a failed attempt (`notice`, `caps_lock`), or further
+//! questions (`messages`, `fields`). See `assets/dev/state-*-password.json`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{Local, NaiveDateTime, TimeZone};
 use reclogin::brand::Brand;
-use reclogin::protocol::{Layout, Power, State, User};
+use reclogin::protocol::{Layout, MessageKind, Power, PromptKind, State, User};
+use serde::Deserialize;
 use tiny_skia::Pixmap;
 
-use crate::form::Form;
+use crate::form::{Answered, Field, Form};
 use crate::paint::Look;
-use crate::screens::{login, Clock};
+use crate::screens::{self, login, Clock};
+
+/// The optional `"sample"` object of a `--state` file.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Overlay {
+    sample: Option<Sample>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Sample {
+    /// Characters in the field being typed; overrides `--typed`.
+    typed: Option<usize>,
+    notice: Option<(MessageKind, String)>,
+    caps_lock: bool,
+    messages: Vec<(MessageKind, String)>,
+    fields: Vec<SampleField>,
+}
+
+#[derive(Deserialize)]
+struct SampleField {
+    label: String,
+    kind: PromptKind,
+    /// Length of a secret answer already sent; none: being typed.
+    #[serde(default)]
+    answered: Option<usize>,
+}
 
 pub struct Options {
     pub png: PathBuf,
@@ -83,18 +116,22 @@ pub fn parse_size(text: &str) -> Result<(u32, u32)> {
     Ok((w, h))
 }
 
-fn read_state(path: &Path) -> Result<State> {
+fn read_state(path: &Path) -> Result<(State, Option<Sample>)> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))
+    let state =
+        serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
+    let overlay: Overlay =
+        serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
+    Ok((state, overlay.sample))
 }
 
 pub fn render(options: &Options) -> Result<()> {
     let brand = Brand::load(&options.brand_dir)?;
     let mut look = Look::load(brand)?;
-    let state = match &options.state {
+    let (state, sample) = match &options.state {
         Some(path) => read_state(path)?,
-        None => sample_state(),
+        None => (sample_state(), None),
     };
     let now = match &options.at {
         Some(text) => {
@@ -108,14 +145,31 @@ pub fn render(options: &Options) -> Result<()> {
         None => Local::now(),
     };
     let mut form = Form::new(&state);
-    for _ in 0..options.typed {
+    let mut typed = options.typed;
+    if let Some(sample) = sample {
+        typed = sample.typed.unwrap_or(typed);
+        form.notice = sample.notice;
+        form.caps_lock = sample.caps_lock;
+        form.talk.messages = sample.messages;
+        for (i, field) in sample.fields.into_iter().enumerate() {
+            if field.answered.is_none() {
+                form.talk.asking = Some((i as u64 + 1, field.kind));
+            }
+            form.talk.fields.push(Field {
+                label: field.label,
+                answer: field.answered.map(Answered::Hidden),
+            });
+        }
+        form.talk.asked = !form.talk.fields.is_empty();
+    }
+    for _ in 0..typed {
         form.password.push('x');
     }
     let clock = Clock::at(now, state.clock_24h);
     let (w, h) = options.size;
     let mut pixmap = Pixmap::new(w, h).context("frame size")?;
     let mut painter = look.begin(&mut pixmap);
-    login::draw(
+    screens::draw(
         &mut painter,
         &login::View {
             state: &state,

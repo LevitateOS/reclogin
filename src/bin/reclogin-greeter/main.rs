@@ -19,6 +19,7 @@ mod kms;
 mod link;
 mod paint;
 mod sample;
+mod sandbox;
 mod screens;
 
 use std::cell::RefCell;
@@ -46,19 +47,20 @@ use screens::{login, Clock, Target};
 
 const WHO: &str = "reclogin-greeter";
 
-const USAGE: &str = "usage: reclogin-greeter
+const USAGE: &str = "usage: reclogin-greeter [--no-sandbox]
        reclogin-greeter --render-png FILE --brand-dir DIR [--size WxH] [--state FILE.json]
                         [--at 'YYYY-MM-DD HH:MM'] [--typed N]
 
-Without arguments it is started by reclogind, which passes its socket.
---render-png draws one frame of the login screen to FILE and exits; it opens
+Without arguments it is started by reclogind, which passes its socket and
+has locked it down; --no-sandbox (passed by `reclogind --no-sandbox`) lets it
+run without that lock-down. --render-png draws one frame of the login screen to FILE and exits; it opens
 no device and no socket. --size defaults to 1920x1080, --state to a built-in
 sample, --at to now, --typed (characters in the password field) to 12.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = if args.is_empty() {
-        run()
+    let result = if args.is_empty() || args == ["--no-sandbox"] {
+        run(args.is_empty())
     } else {
         match render_options(&args) {
             Ok(Some(options)) => sample::render(&options),
@@ -165,8 +167,6 @@ struct Greeter {
     hits: Vec<(Area, Target)>,
     /// The typed password, kept from Enter until PAM asks for it.
     pending: Option<Secret>,
-    /// A question from PAM the next Enter answers.
-    prompt: Option<(u64, PromptKind)>,
     paused: bool,
     dirty: bool,
     /// Pointer drawn into the frame because there is no hardware cursor.
@@ -179,7 +179,9 @@ enum Next {
     Quit,
 }
 
-fn run() -> Result<()> {
+/// `locked`: started by reclogind with the lock-down (no `--no-sandbox`).
+fn run(locked: bool) -> Result<()> {
+    sandbox::check(locked)?;
     let link = Rc::new(RefCell::new(Link::from_env()?));
     let (brand_dir, display, state) = start(&mut link.borrow_mut())?;
     let brand = Brand::load(&brand_dir)?;
@@ -204,7 +206,6 @@ fn run() -> Result<()> {
         frame,
         hits: Vec::new(),
         pending: None,
-        prompt: None,
         paused: false,
         dirty: true,
         soft_pointer: None,
@@ -295,7 +296,7 @@ impl Greeter {
     fn draw(&mut self) -> Result<()> {
         let clock = Clock::at(Local::now(), self.state.clock_24h);
         let mut painter = self.look.begin(&mut self.frame);
-        login::draw(
+        screens::draw(
             &mut painter,
             &login::View {
                 state: &self.state,
@@ -339,45 +340,41 @@ impl Greeter {
                     }
                 }
             }
-            ToGreeter::Prompt { id, kind, text } => match (kind, self.pending.take()) {
-                (PromptKind::Secret, Some(secret)) => {
-                    self.send(&ToDaemon::Answer {
-                        prompt_id: id,
-                        text: secret,
-                    });
-                }
-                _ => {
-                    // A further question (stage 2 shows these in full): the
-                    // next Enter answers it with what is typed.
-                    self.prompt = Some((id, kind));
-                    self.form.busy = false;
-                    self.form.notice = Some((MessageKind::Info, text));
-                }
-            },
-            ToGreeter::Message { kind, text } => match &mut self.form.notice {
-                Some((old_kind, old)) if self.form.busy => {
-                    old.push('\n');
-                    old.push_str(&text);
-                    if kind == MessageKind::Error {
-                        *old_kind = kind;
+            ToGreeter::Prompt { id, kind, text } => {
+                // PAM's first question, when it is a secret one, takes the
+                // password typed on the login screen. Any other question is
+                // shown as a field of its own; a password still waiting is
+                // overwritten as it is dropped here, so it can never answer
+                // a later question (a new password, say).
+                let first = !self.form.talk.asked;
+                self.form.talk.asked = true;
+                match (first, kind, self.pending.take()) {
+                    (true, PromptKind::Secret, Some(secret)) => {
+                        self.send(&ToDaemon::Answer {
+                            prompt_id: id,
+                            text: secret,
+                        });
                     }
+                    _ => self.form.ask(id, kind, text),
                 }
-                notice => *notice = Some((kind, text)),
-            },
+            }
+            ToGreeter::Message { kind, text } => self.form.talk.messages.push((kind, text)),
             ToGreeter::AuthResult { ok, text } => {
-                self.form.busy = false;
                 self.pending = None;
-                self.prompt = None;
-                if !ok {
-                    self.form.clear_password();
-                    self.form.focus = Focus::Password;
-                    if !text.is_empty() {
-                        self.form.notice = Some((MessageKind::Error, text));
-                    }
-                }
+                self.form.finish(ok, text);
             }
             ToGreeter::Pause => {
                 self.paused = true;
+                // A typed password does not wait on a screen nobody sees.
+                // Not silently: the screen says so when it is shown again.
+                // A password already sent (`pending`) is not affected.
+                if !self.form.password.is_empty() {
+                    self.form.clear_password();
+                    self.form.notice = Some((
+                        MessageKind::Info,
+                        "The password was cleared when you left this screen.".into(),
+                    ));
+                }
                 self.input.suspend();
                 self.screen.pause();
                 return Next::Continue;
@@ -445,6 +442,7 @@ impl Greeter {
                     self.act(action);
                 }
             }
+            Target::Cancel => self.act(Action::Cancel),
             // The session menu and the layout switcher are later stages.
             Target::Session => self.form.focus = Focus::Session,
             Target::Layout => self.form.focus = Focus::Layout,
@@ -456,18 +454,26 @@ impl Greeter {
     fn act(&mut self, action: Action) {
         match action {
             Action::SwitchConsole(number) => self.send(&ToDaemon::SwitchConsole { number }),
+            Action::Cancel => {
+                self.pending = None;
+                self.form.finish(false, String::new());
+                self.form.talk.messages.clear();
+                self.send(&ToDaemon::Cancel);
+            }
             Action::Submit => {
                 let secret = Secret::copy_from(&self.form.password);
-                self.form.clear_password();
-                self.form.notice = None;
-                self.form.busy = true;
-                if let Some((prompt_id, _)) = self.prompt.take() {
+                if let Some((prompt_id, _)) = self.form.talk.asking {
+                    self.form.answered();
                     self.send(&ToDaemon::Answer {
                         prompt_id,
                         text: secret,
                     });
                     return;
                 }
+                self.form.clear_password();
+                self.form.notice = None;
+                self.form.busy = true;
+                self.form.talk = form::Talk::default();
                 let Some(user) = self.form.chosen.and_then(|i| self.state.users.get(i)) else {
                     self.form.busy = false;
                     return;

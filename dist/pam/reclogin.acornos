@@ -1,0 +1,14 @@
+# reclogin's PAM service on AcornOS, installed as /etc/pam.d/reclogin.
+#
+# Alpine's layout: the same four base files as linux-pam's own `login`
+# service (the one util-linux-login and shadow-login use). base-session
+# carries `-session optional pam_elogind.so`, which registers the session
+# with elogind from the XDG_SEAT, XDG_VTNR, XDG_SESSION_TYPE,
+# XDG_SESSION_CLASS and XDG_SESSION_DESKTOP that reclogind puts into the
+# PAM environment; it is not listed again here, which would register the
+# session twice. base-auth and base-session also carry the desktop wallets'
+# optional modules.
+auth      include    base-auth
+account   include    base-account
+password  include    base-password
+session   include    base-session

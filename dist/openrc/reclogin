@@ -1,0 +1,35 @@
+#!/sbin/openrc-run
+# reclogin: the login screen, on console 7 (AcornOS, OpenRC).
+#
+# Text logins stay on consoles 1 to 6 (inittab). reclogind runs in the
+# foreground; OpenRC starts it in the background, records its pid and
+# reports it as crashed if it dies. It is not respawned: reclogind restarts
+# a crashed greeter itself, and after three failures within a minute it
+# exits with status 3 and must stay stopped so the machine stays on its text
+# logins. supervise-daemon cannot leave out a respawn for one exit status,
+# so it is not used.
+
+description="reclogin login screen"
+
+command="/usr/bin/reclogind"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+# reclogind writes to standard error; the give-up reason also goes to
+# syslog directly.
+output_logger="logger -t reclogind -p daemon.info"
+error_logger="logger -t reclogind -p daemon.err"
+# SIGTERM: reclogind tells the greeter to quit and gives the console back.
+retry="TERM/10/KILL/2"
+
+depend() {
+	need elogind dbus
+	use logger
+	after bootmisc
+	provide display-manager
+}
+
+stop_post() {
+	# After a SIGKILL nobody gave console 7 back; this does, and does
+	# nothing when reclogind stopped cleanly.
+	/usr/bin/reclogind --reset-console 7 || true
+}

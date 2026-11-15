@@ -7,8 +7,8 @@ display, with no X server, compositor or toolkit under it. The design is in
 the LevitateOS repository: `docs/reclogin.md`, `docs/reclogin-technical.md`,
 `docs/reclogin-plan.md` and the screens in `docs/reclogin-design/`.
 
-Status: **stage 1 of the plan, written and compile-checked, never run** (see
-"Not done").
+Status: **stages 1, 2 and 9 of the plan, written and compile-checked, never
+run** (see "Not done").
 
 ## The two programs
 
@@ -55,7 +55,12 @@ byte values, and is overwritten on both sides after use.
   family renamed "Newsreader Display", because the text library sets the
   weight axis but not optical size, and the design's browser draws the clock
   and the greeting at large optical sizes.
-- `assets/dev/state-*.json`: sample states for `--render-png`.
+- `assets/dev/state-*.json`: sample states for `--render-png`. A file may
+  also carry a `"sample"` object that puts the form where PAM would leave it:
+  `state-levitateos-wrong-password.json` (a failed attempt with Caps Lock on)
+  and `state-acornos-expired-password.json` (an expired password being
+  changed). Draw them with `--at '2026-11-15 21:43'` and
+  `--at '2026-11-16 08:15'` to match the design files.
 
 ## Development switches
 
@@ -68,14 +73,210 @@ reclogin-greeter --render-png out.png --brand-dir assets/levitateos \
 # The login screen on another console, with another greeter or account.
 reclogind --console 8 --greeter target/debug/reclogin-greeter \
     --greeter-user nobody --config ./reclogin.conf --brand-dir assets/levitateos
+
+# The same without the greeter's lock-down (below); reclogind passes
+# --no-sandbox on to the greeter, which otherwise refuses to run unlocked.
+reclogind --no-sandbox ...
 ```
+
+`--render-png` is not affected by any of the lock-down. On a development
+machine without libinput's development files, link the greeter against the
+library itself through a folder holding a `libinput.so` link to
+`/usr/lib64/libinput.so.10`:
+`RUSTFLAGS="-L <that folder>" cargo build -p reclogin --bin reclogin-greeter`.
+
+## Logging in (stage 2)
+
+One login at a time. For each one reclogind starts itself again as a
+**session worker** (`reclogind --session-worker`, `src/bin/reclogind/worker.rs`):
+a separate single-threaded root process with its end of a private socket
+pair as descriptor 3, the way `sddm-helper` and `gdm-session-worker` work.
+The worker owns the login's PAM handle from start to end. PAM's
+conversation is synchronous, so it must not block reclogind's main loop; and
+the login service registers the process that opens the PAM session as the
+session's first process, which must not be reclogind.
+
+Worker and reclogind speak their own small message set (same socket kind and
+framing as the greeter's): to the worker `start {user, session}`,
+`answer {secret}`, `console {number}`, `cancel`; from the worker
+`prompt {kind, text}`, `message {kind, text}`, `failed {text}`,
+`need_console`, `ready_to_start {console}`, `started`, `ended {status}`.
+
+### The PAM service
+
+`reclogin` (`dist/pam/reclogin.levitateos` and `dist/pam/reclogin.acornos`,
+installed as `/etc/pam.d/reclogin`). Each accepts what the OS's text-login
+PAM service accepts: on LevitateOS the lines of util-linux's `login` over
+systemd's `system-auth`, plus the optional wallet modules SDDM's file had;
+on AcornOS linux-pam's own `login` (the `base-*` files, whose `base-session`
+carries `pam_elogind`). The libpam functions are declared by hand
+(`src/bin/reclogind/pam.rs`) so the crate compiles without libpam's
+development files.
+
+### What a login does, step by step
+
+1. The greeter sends `choose_session` (if a session is chosen) and
+   `begin {who}`, and keeps the typed password. reclogind checks the person
+   (a listed user must be in the list; a typed name may be any account,
+   root included; the guest is stage 7) and the session (installed; else
+   the first one), starts a worker and sends it `start`.
+2. The worker reads the session file. An X session is refused here with
+   "X sessions are not built yet." (stage 3 adds `xserver.rs`).
+3. `pam_start("reclogin", user)`, then `pam_authenticate`. Every question
+   and message of PAM's conversation goes to the greeter in order and word
+   for word (`prompt` / `message`); PAM's first question, when secret, is
+   answered with the kept password, every other one is shown as a field.
+   A failure is reported as "Authentication failed." unless PAM said why in
+   an error message of its own; the log gets PAM's own description, the
+   screen never does.
+4. `pam_acct_mgmt`. On `PAM_NEW_AUTHTOK_REQD` the worker says "Current
+   password accepted." (its own line, `MessageKind::Success`), passes on
+   what PAM said meanwhile, and runs `pam_chauthtok(PAM_CHANGE_EXPIRED_AUTHTOK)`
+   with its questions on the same screen ("Choose a new password.").
+5. The worker asks for a console. reclogind gives the first console after
+   the login console that nobody has open (consoles 1 to 6 keep their text
+   logins).
+6. The worker hands that console's device to the user (owner the user,
+   group `tty`, mode 0620), sets `PAM_TTY` and puts `XDG_SEAT=seat0`,
+   `XDG_VTNR`, `XDG_SESSION_TYPE`, `XDG_SESSION_CLASS=user` and
+   `XDG_SESSION_DESKTOP` (the session file's first `DesktopNames`, else its
+   name) into the PAM environment, then `pam_setcred(ESTABLISH)`,
+   `pam_open_session`, `pam_setcred(REINITIALIZE)`, and says `ready_to_start`.
+7. reclogind tells the greeter it succeeded, `pause`, gives the display and
+   the input devices up, stops the greeter (an expected exit) and shows the
+   session's console. While the session runs no greeter runs; if console 7
+   is shown meanwhile, the session's console is shown again.
+8. Once the console is shown (or after ten seconds) the worker forks the
+   desktop's process: a new session with the console as its controlling
+   terminal and standard input (output and errors go where reclogind's go:
+   the system log), the user's groups, gid and uid, PAM's environment plus
+   `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH` (when PAM has none) and
+   `XDG_CURRENT_DESKTOP` from `DesktopNames`. It runs
+   `$SHELL -l -c "exec <Exec>"` so the user's profile is read; under
+   `dbus-run-session --` when the login service gives no session bus (no
+   `DBUS_SESSION_BUS_ADDRESS` in PAM's environment and no
+   `/run/user/<uid>/bus`, waited for up to three seconds on a system started
+   by systemd).
+9. When the desktop's process exits (or reclogind asks the worker to end it:
+   SIGTERM to its process group, SIGKILL after ten seconds), the worker
+   hangs up the console, `pam_close_session`, `pam_setcred(DELETE)`, gives the
+   console back to its old owner and mode, `pam_end`, says `ended` and exits.
+10. reclogind starts a fresh greeter through the supervisor and shows
+    console 7.
+
+`cancel` from the greeter, and a greeter replaced in the middle of a
+conversation, end the worker (PAM gets a refused conversation). When
+reclogind stops it ends a running session the same way and waits for the
+worker.
+
+### Secrets on the way
+
+- Greeter: the typed text is in storage reserved up front and overwritten
+  when cleared; it is copied into a `Secret` (overwritten when dropped) and
+  sent as an array of byte values. A secret answer leaves only its length on
+  the screen.
+- Socket: send and receive buffers are overwritten after each message.
+- reclogind: the `Secret` from the greeter is moved into the message to the
+  worker and dropped (overwritten) after sending; an answer to no open
+  question is dropped the same way.
+- Worker: the `Secret` is copied into a `malloc` buffer for PAM and
+  overwritten as it goes out of scope. Replies not handed to PAM are
+  overwritten before `free`.
+- **Not overwritten by reclogin:** the buffer once PAM has it (Linux-PAM's
+  modules overwrite it before `free`, reclogin cannot check), the copies PAM
+  and its modules keep (`PAM_AUTHTOK` until `pam_end`, hashing buffers), the
+  kernel's socket buffers, and the text laid out for drawing while "show
+  password" is on.
+
+## Starting, restarting, giving up (stage 9)
+
+- The init system starts `reclogind` (the files under `dist/`). It takes
+  console 7, the display, and starts the greeter.
+- A greeter that exits, closes its socket or cannot be reached without
+  reclogind having asked it to go is replaced at once. A greeter that
+  cannot even be started (the program or the account `reclogin` missing)
+  counts the same. A greeter that goes because reclogind asked it to (`quit`,
+  a session taking over: whoever stops it calls `Supervisor::stopping`
+  with its process id, which `stop_greeter` does) never counts. Starting a
+  greeter again after a session: `Supervisor::launch_until_up` (starts it,
+  sends `hello`, the display and the state, counts failures).
+- A greeter replaced while console 7 is not shown gets `hello` only, and the
+  display and the state when the console is shown again (it would otherwise
+  fail to set the mode and count as a crash).
+- Three failures within sixty seconds: reclogind gives up. It writes the
+  reason to the system log (syslog, facility daemon) and to standard error,
+  gives the display up, puts console 7 back in text mode with its keyboard
+  mode, writes on console 1 "The login screen stopped: it failed to start
+  three times within a minute. Log in here." (with what was missing in
+  brackets when the greeter could not be started) and a newline, shows
+  console 1, and exits with status **3**. Neither init service starts it
+  again on that status.
+- SIGTERM or SIGINT (and SIGHUP): `quit` to the greeter, two seconds, then
+  SIGKILL; the display given up, console 7 back in text mode with its
+  keyboard mode, the console reclogind started from shown again; exit 0.
+- If reclogind panics or gets a fatal signal (SIGSEGV, SIGBUS, SIGILL,
+  SIGFPE, SIGABRT, SIGQUIT, SIGSYS, SIGTRAP, SIGXCPU, SIGXFSZ), a panic hook
+  and signal handlers give the console back from numbers recorded when it
+  was taken. Every other early return drops the console, which gives it
+  back. SIGKILL cannot be caught: `reclogind --reset-console 7`, which the
+  init services run after reclogind has stopped, gives console 7 back if it
+  is still in graphics mode and shows console 1.
+- Console switches the greeter asks for (Ctrl+Alt+F1 to F12) go to consoles
+  1 to 12 only. On `pause` the greeter clears a half-typed password and says
+  so when the screen is shown again; a password already sent to reclogind is
+  not affected.
+
+Exit statuses: 0 stopped on request, 1 an error, 2 bad arguments, 3 gave up.
+
+## The greeter's lock-down
+
+Applied by reclogind in the greeter's process between fork and exec
+(`src/bin/reclogind/greeter.rs`, `sandbox.rs`), so the greeter never runs
+unconfined and cannot skip it. `--no-sandbox` turns off the items marked *.
+
+| Item | Where | What |
+|---|---|---|
+| Account | fork–exec | `reclogin`, no supplementary groups. |
+| No capabilities* | fork–exec | Bounding and ambient sets cleared while still root; the account change clears permitted and effective; the inheritable set is cleared after it and all three are checked to be empty. |
+| No-new-privileges | fork–exec | Always. A later `setuid(0)` must fail, or the greeter does not start. |
+| No network* | fork–exec | A new network namespace with nothing in it (left out, with a log line, on a kernel without network namespaces). |
+| No core dumps* | fork–exec | Core size limit 0. The greeter also marks itself not dumpable at its start (exec resets that flag, so only it can), which also keeps other processes of its account out of its memory. |
+| Limits* | fork–exec | 256 open files, 32 processes and threads for the account. |
+| Nothing inherited | fork–exec | Descriptors 0 (`/dev/null`), 1 and 2 (reclogind's output and error) and 3 (the socket) only; every other one is closed at exec. Empty environment except `RECLOGIN_SOCKET`. Always. |
+| Parent death | fork–exec | SIGTERM when reclogind dies, set after the account change (which clears it); a greeter whose reclogind already died does not start. |
+| Files (Landlock)* | fork–exec | Every right the kernel's Landlock knows is handled; only these are allowed, read-only: the brand folder and `../fonts` beside it; `/usr/share/X11/xkb`, `/etc/xkb`; `/etc/localtime`, `/usr/share/zoneinfo`; `/dev/input` (listing only); `/sys`, `/run/udev/data`, `/etc/udev/udev.conf`, `/usr/share/libinput`, `/etc/libinput`, `/usr/share/libwacom`, `/etc/libwacom` (libinput and its udev library); the library folders `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, `/usr/local/lib`, `/usr/local/lib64`; `/etc/ld.so.cache`, `/etc/ld.so.preload` (glibc), `/etc/ld-musl-x86_64.path` (musl). Execute on two files only: the greeter program and the loader its ELF header names (`/lib64/ld-linux-x86-64.so.2` on glibc, `/lib/ld-musl-x86_64.so.1` on musl). Nothing writable. Paths missing on a system are left out. With ABI 4 TCP is refused too; with ABI 6 abstract sockets and signals outside the greeter. Without Landlock the greeter still starts and reclogind logs that it runs without it. Handles reclogind passes (display, input devices) were opened outside the rules and keep working. |
+| Checked by the greeter | its start | Refuses to run as root; refuses to run without no-new-privileges unless started with `--no-sandbox`. |
+
+## Files under dist/
+
+| File | For |
+|---|---|
+| `dist/systemd/reclogin.service` | LevitateOS. After `systemd-logind`, `dbus`, `systemd-user-sessions`; conflicts with `getty@tty7`; `Alias=display-manager.service`. `Restart=on-failure` but not after status 2 or 3, at most three starts a minute; `KillMode=mixed` so only reclogind gets SIGTERM; output and errors to the journal; `ExecStopPost` runs `reclogind --reset-console 7`. |
+| `dist/openrc/reclogin` | AcornOS. Needs `elogind` and `dbus`, provides `display-manager`. reclogind runs in the foreground, backgrounded and tracked by OpenRC (pid file), never respawned: supervise-daemon cannot leave out a respawn for one exit status. Output to syslog through `logger`. `stop_post` runs `reclogind --reset-console 7`. |
+| `dist/sysusers/reclogin.conf` | The account `reclogin`: a system account, no shell, home `/`, no extra groups. |
+
+Both services start `/usr/bin/reclogind`; where stage 10 installs it may
+change that path. The PAM files (`dist/pam/`) are described under "Logging
+in".
 
 ## Not done
 
-Everything after stage 1 of `docs/reclogin-plan.md`:
+Everything of `docs/reclogin-plan.md` after stage 1 except stages 2 and 9:
 
-- logging in: PAM, sessions, X sessions (stages 2, 3). reclogind answers a
-  login attempt with "Logging in is not built yet.";
+- stage 2 (above) is written and compile-checked, never run: no PAM module
+  of either OS was called, no session was started, no console handed over.
+  Not seen on a real system: how `pam_systemd` and `pam_elogind` take
+  `PAM_TTY=ttyN` and the `XDG_*` values; whether a Plasma or LXQt session
+  started this way gets its devices from logind; whether `/run/user/<uid>/bus`
+  appears within three seconds on LevitateOS; whether `pam_unix`'s questions
+  during an expired-password change look as assumed (its
+  "Current password:" question is asked again after "Current password
+  accepted."); the AcornOS PAM file against a system whose text login is
+  busybox's `login`, which does not use PAM at all (so "what the text login
+  accepts" there means the same shadow file through `pam_unix`, not the same
+  program; busybox does not enforce password ageing, `pam_unix` does). No
+  shake on a wrong password: the screen is drawn still;
+- X sessions (stage 3): refused with "X sessions are not built yet.";
 - the session menu, the layout switcher, "Other user…", the no-users screen,
   remembering the last user and session (stage 4);
 - who is logged in, returning to a session, power actions (stage 5; the
@@ -83,8 +284,11 @@ Everything after stage 1 of `docs/reclogin-plan.md`:
 - automatic login (stage 6), the guest (stage 7);
 - the on-screen keyboard, several monitors, idle switch-off, input devices
   plugged in after start (stage 8);
-- restarting a crashed greeter and giving up after three crashes, the init
-  services, the greeter's lock-down (stage 9);
+- stage 9 (above) is written and compile-checked, never run: no greeter
+  was crashed on purpose, no lock-down item was seen working on either
+  kernel, the services were not installed, and the Landlock path list was
+  not checked against what libinput, its udev library and the loaders
+  really open;
 - the per-OS build and shipping (stage 10).
 
 **Nothing here was run on a console or a display.** It was compile-checked;
