@@ -26,20 +26,26 @@ Its asset is `login-screen-levitate.tar.gz` / `login-screen-acorn.tar.gz`.
    `recipes/login-screen.rhai` (replace the whole file: the SDDM group, its
    `SEEDS_MUSL = ["sddm"]`, its `ACCOUNTS_MUSL` sddm lines, both generated pin
    blocks and the Maldives theme configuration all go).
-2. In the copy, fill `const PINS = #{};` with the two releases, as
-   `recipes/rec-apps.rhai` has them:
+2. In the copy, fill `const SOURCES = #{};` with the two releases, one
+   source per C library, each named for its library and carrying `libc`
+   (API 1, as `recipes/steam.rhai` has its `valve` source):
    ```
-   const PINS = #{
-       glibc: ["login-screen-levitate.tar.gz",
-               "https://github.com/LevitateOS/prebuilt/releases/download/login-screen-<key16>/login-screen-levitate.tar.gz",
-               "<sha256 GitHub shows for the asset>"],
-       musl:  ["login-screen-acorn.tar.gz",
-               "https://github.com/LevitateOS/prebuilt/releases/download/login-screen-<key16>/login-screen-acorn.tar.gz",
-               "<sha256>"],
+   const SOURCES = #{
+       glibc: #{
+           url: "https://github.com/LevitateOS/prebuilt/releases/download/login-screen-<key16>/login-screen-levitate.tar.gz",
+           sha256: "<sha256 GitHub shows for the asset>",
+           libc: "glibc",
+       },
+       musl: #{
+           url: "https://github.com/LevitateOS/prebuilt/releases/download/login-screen-<key16>/login-screen-acorn.tar.gz",
+           sha256: "<sha256>",
+           libc: "musl",
+       },
    };
    ```
    and set `network_max_bytes` in `NEEDS` to the larger archive's size,
-   rounded up.
+   rounded up. The recipe's `build` reads `src.glibc` or `src.musl` by
+   `HOST_LIBC`; nothing else in it names a release.
 3. In the header's "NOT ACTIVE YET" paragraph (lines 6-10 of the copy),
    delete everything before "It names no packages", which stays true.
 4. Check it: `target/release/recipe info recipes/login-screen.rhai`.
