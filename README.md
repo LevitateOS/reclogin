@@ -7,8 +7,8 @@ display, with no X server, compositor or toolkit under it. The design is in
 the LevitateOS repository: `docs/reclogin.md`, `docs/reclogin-technical.md`,
 `docs/reclogin-plan.md` and the screens in `docs/reclogin-design/`.
 
-Status: **stages 1, 2, 3, 4, 5, 7 and 9 of the plan, written and compile-checked,
-never run** (see "Not done").
+Status: **all ten stages of the plan, written and compile-checked, never
+run** (see "Not done").
 
 ## The two programs
 
@@ -735,11 +735,10 @@ both keys.
 
 The installer's `autologin` command (`recipe-system-setup`,
 `distro/builder/guest/installed/system-setup.sh`) writes `autologin = USER`
-and `autologin_session = SESSION` into `/etc/reclogin.conf` when
-`/usr/bin/reclogind` exists in the system it configures (other lines kept;
-the two keys replaced in place or added), and the SDDM file otherwise. That
-SDDM branch goes at the switch. `recsetup` (`plan.rs`) accepts a target that
-has `reclogind` or `sddm` for `--autologin`.
+and `autologin_session = SESSION` into `/etc/reclogin.conf` (other lines
+kept; the two keys replaced in place or added). `recsetup` (`plan.rs`)
+accepts `--autologin` for a target that has `reclogind`, or that gets it from
+the default software set.
 
 ### The guest, two connections
 
@@ -944,9 +943,7 @@ unconfined and cannot skip it. `--no-sandbox` turns off the items marked *.
 | `dist/openrc/reclogind-run` | AcornOS, installed as `/usr/libexec/reclogin/reclogind-run` (mode 0755). OpenRC runs `stop_post` only on a requested stop; the wrapper runs reclogind, passes SIGTERM, SIGINT and SIGHUP on, and after reclogind ended for whatever reason runs `reclogind --reset-console 7` and exits with reclogind's status. Writes reclogind's pid to `/run/reclogin/reclogind.pid`. |
 | `dist/sysusers/reclogin.conf` | The account `reclogin`: a system account, no shell, home `/`, no extra groups. The guest account and group (see "The guest"). |
 | `dist/guest/` | The guest's other installed files (see "The guest"). |
-
 | `dist/reclogin.conf` | The default `/etc/reclogin.conf`: every key, commented out. |
-| `dist/recipe/login-screen.rhai` | The `login-screen` group recipe for both OSes, prepared and not active: it installs the pinned `login-screen` prebuilt and enables the service. `dist/recipe/SWITCH.md` says how it replaces SDDM. |
 
 Both services start `/usr/bin/reclogind` (OpenRC through the wrapper), and
 reclogind starts `/usr/bin/reclogin-greeter` beside it. The OS builder
@@ -1090,9 +1087,12 @@ Everything of `docs/reclogin-plan.md` after stage 1 except stages 2, 3, 4, 5 and
   kernel, the services were not installed, and the Landlock path list was
   not checked against what libinput, its udev library and the loaders
   really open;
-- shipping (stage 10): the per-OS build, the prebuilt `login-screen` and the
-  prepared group recipe are written, never run; nothing is published and
-  SDDM is still the login screen of both OSes (`dist/recipe/SWITCH.md`).
+- shipping (stage 10): the per-OS build and the prebuilt `login-screen` are
+  written, and both prebuilts are published (`login-screen-86d815752d902d81`,
+  LevitateOS; `login-screen-ffd914bc27cad91d`, AcornOS). The switch from SDDM
+  is written (2026-11-16): the LevitateOS repository's group recipe
+  `recipes/login-screen.rhai` pins both releases and is in both OSes' default
+  set. Nothing of it has been built into an image or run.
 
 **Nothing here was run on a console or a display.** It was compile-checked;
 the only thing run was `--render-png`.
